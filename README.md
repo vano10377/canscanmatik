@@ -35,10 +35,7 @@ WinForms application for reading and transmitting classic CAN frames through `Sc
 
 ## Build
 
-```powershell
-$env:DOTNET_CLI_HOME='C:\Users\vano\Desktop\codex\canscanmatik\.dotnet'
-dotnet build -c Release
-```
+
 
 ## Run
 
