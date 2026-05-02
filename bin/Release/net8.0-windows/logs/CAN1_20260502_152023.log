@@ -1,0 +1,13 @@
+# Start: 2026-05-02 15:20:23
+# Adapter: Scanmatik SM2 USB
+# Bus: CAN1
+# Bitrate: 500k
+# Frames: 11-bit
+# Firmware: FW:1096 HW:02 SN:A87720
+# DLL: 1.0.0.130 (built 30.03.2025)
+# API: 04.04
+
+LOG   C:\Users\vano\Desktop\codex\canscanmatik\bin\Release\net8.0-windows\logs\CAN1_20260502_152023.log
+OPEN  Scanmatik SM2 USB
+BUS   CAN1
+LINK  500k, standard 11-bit

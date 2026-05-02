@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
 using System.Text;
+using System.Text.Json;
 
 namespace CanScanmatik;
 
@@ -11,6 +12,9 @@ internal sealed class MainForm : Form
     private const int LogTargetLength = 100_000;
     private const int VisibleByteColumns = 8;
     private const int GridRefreshBatchSize = 500;
+    private const int ReadLoopTimeoutMs = 100;
+    private const int ReadLoopBatchSize = 32;
+    private const int ReadLoopIdleDelayMs = 1;
     private const int ChangedByteHoldMs = 250;
     private static readonly Color ChangedByteBackColor = Color.FromArgb(255, 255, 0);
     private static readonly Color ChangedByteForeColor = Color.FromArgb(180, 0, 0);
@@ -18,7 +22,7 @@ internal sealed class MainForm : Form
     private readonly ComboBox driverCombo = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 260 };
     private readonly ComboBox bitrateCombo = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 95 };
     private readonly ComboBox frameFormatCombo = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 125 };
-    private readonly ComboBox busCombo = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 90 };
+    private readonly ComboBox busCombo = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 126 };
     private readonly ComboBox sortCombo = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 110 };
     private readonly TextBox filterTextBox = new() { Width = 100, PlaceholderText = "208" };
     private readonly Button refreshButton = new() { Text = "Refresh", AutoSize = true };
@@ -27,13 +31,39 @@ internal sealed class MainForm : Form
     private readonly Button clearButton = new() { Text = "Clear Bus", AutoSize = true };
     private readonly Button exportButton = new() { Text = "Save CSV", AutoSize = true };
     private readonly Button saveIdsButton = new() { Text = "Save IDs", AutoSize = true };
+    private readonly Button logToggleButton = new() { Text = "Start Log", AutoSize = true, Enabled = false };
     private readonly Label statusLabel = new() { AutoSize = true, Text = "Disconnected" };
+    private readonly Label rxInfoLabel = new() { AutoSize = true, Text = "RX: 0" };
     private readonly Label adapterInfoLabel = new() { AutoSize = true };
     private readonly Label busHintLabel = new() { AutoSize = true };
-    private readonly DataGridView frameGrid = new();
+    private readonly TextBox txIdTextBox = new() { Width = 110, Text = "208", PlaceholderText = "208" };
+    private readonly NumericUpDown txDlcUpDown = new() { Minimum = 0, Maximum = VisibleByteColumns, Width = 55, Value = 8 };
+    private readonly TextBox[] txByteTextBoxes = CreateTransmitByteTextBoxes();
+    private readonly NumericUpDown txIntervalUpDown = new() { Minimum = 5, Maximum = 5000, Width = 75, Value = 100 };
+    private readonly Button captureRowButton = new() { Text = "Capture Row", AutoSize = true };
+    private readonly Button addTxButton = new() { Text = "Add TX", AutoSize = true };
+    private readonly Button updateTxButton = new() { Text = "Update TX", AutoSize = true };
+    private readonly Button removeTxButton = new() { Text = "Remove TX", AutoSize = true };
+    private readonly Button clearTxListButton = new() { Text = "Clear TX", AutoSize = true };
+    private readonly Button loadTxListButton = new() { Text = "Load TX", AutoSize = true };
+    private readonly Button saveTxListButton = new() { Text = "Save TX", AutoSize = true };
+    private readonly Button sendOnceButton = new() { Text = "Send Once", AutoSize = true };
+    private readonly Button sendListButton = new() { Text = "Send List", AutoSize = true };
+    private readonly Button startTransmitButton = new() { Text = "Start TX", AutoSize = true };
+    private readonly Button stopTransmitButton = new() { Text = "Stop TX", AutoSize = true, Enabled = false };
+    private readonly CheckBox sweepEnabledCheckBox = new() { AutoSize = true, Text = "Sweep byte" };
+    private readonly ComboBox sweepByteCombo = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 58 };
+    private readonly TextBox sweepFromTextBox = new() { Width = 42, Text = "00", MaxLength = 2 };
+    private readonly TextBox sweepToTextBox = new() { Width = 42, Text = "FF", MaxLength = 2 };
+    private readonly TextBox sweepStepTextBox = new() { Width = 42, Text = "01", MaxLength = 2 };
+    private readonly Label txHintLabel = new() { AutoSize = true };
+    private readonly BufferedDataGridView frameGrid = new();
+    private readonly BufferedDataGridView txQueueGrid = new();
     private readonly TextBox logBox = new();
     private readonly System.Windows.Forms.Timer uiTimer = new() { Interval = 40 };
+    private readonly System.Windows.Forms.Timer transmitTimer = new() { Interval = 100 };
     private readonly ConcurrentQueue<QueuedFrame> pendingFrames = new();
+    private readonly List<TransmitPlan> transmitQueue = [];
     private readonly Dictionary<string, BusWorkspace> busWorkspaces = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<BitrateOption> bitrateOptions = BitrateOption.CreateDefaults();
     private readonly List<BusProfileOption> busOptions = BusProfileOption.CreateDefaults();
@@ -46,6 +76,19 @@ internal sealed class MainForm : Form
     private StreamWriter? sessionLogWriter;
     private string? sessionLogFilePath;
     private int uiDrainScheduled;
+    private TransmitPlan? activeTransmitPlan;
+    private List<TransmitPlan>? activeTransmitSequence;
+    private int activeTransmitSequenceIndex;
+    private PassThruDriverInfo? connectedDriver;
+    private BitrateOption? connectedBitrate;
+    private FrameFormatOption? connectedFrameFormat;
+    private BusProfileOption? connectedBusProfile;
+    private string? connectedFirmwareVersion;
+    private string? connectedDllVersion;
+    private string? connectedApiVersion;
+    private long totalReceivedFrames;
+    private DateTime lastReceivedAtUtc;
+    private string? lastReceivedSummary;
 
     public MainForm()
     {
@@ -54,25 +97,39 @@ internal sealed class MainForm : Form
         EnsureBusWorkspaces();
         LoadDrivers();
         RefreshGrid();
+        RefreshTransmitQueueGrid();
+        ResetReceiveIndicator();
+        ApplyTransmitDlcState();
+        UpdateTransmitHint();
+        UpdateTransmitButtonState();
+        UpdateLogButtonState();
+        UpdateBusHint();
     }
 
     private void InitializeUi()
     {
         Text = "CanScanmatik";
         StartPosition = FormStartPosition.CenterScreen;
-        MinimumSize = new Size(1280, 820);
-        Size = new Size(1460, 920);
+        MinimumSize = new Size(1024, 680);
+
+        Rectangle workingArea = Screen.PrimaryScreen?.WorkingArea ?? new Rectangle(0, 0, 1460, 920);
+        Size preferredSize = new(1460, 920);
+        Size = new Size(
+            Math.Min(preferredSize.Width, workingArea.Width),
+            Math.Min(preferredSize.Height, workingArea.Height));
 
         TableLayoutPanel root = new()
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 3,
+            RowCount = 4,
             Padding = new Padding(10)
         };
+        root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 220f));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 240f));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 140f));
         Controls.Add(root);
 
         GroupBox connectionGroup = new()
@@ -81,6 +138,7 @@ internal sealed class MainForm : Form
             AutoSize = true,
             Text = "Scanmatik J2534"
         };
+        connectionGroup.Margin = new Padding(0, 0, 0, 8);
         root.Controls.Add(connectionGroup, 0, 0);
 
         FlowLayoutPanel connectionPanel = new()
@@ -129,22 +187,25 @@ internal sealed class MainForm : Form
         connectionPanel.Controls.Add(clearButton);
         connectionPanel.Controls.Add(exportButton);
         connectionPanel.Controls.Add(saveIdsButton);
+        connectionPanel.Controls.Add(logToggleButton);
 
         statusLabel.Margin = new Padding(14, 8, 0, 0);
         connectionPanel.Controls.Add(statusLabel);
+        rxInfoLabel.Margin = new Padding(14, 8, 0, 0);
+        connectionPanel.Controls.Add(rxInfoLabel);
 
         adapterInfoLabel.Margin = new Padding(0, 10, 0, 0);
         adapterInfoLabel.MaximumSize = new Size(1320, 0);
-        connectionPanel.SetFlowBreak(statusLabel, true);
+        connectionPanel.SetFlowBreak(rxInfoLabel, true);
         connectionPanel.Controls.Add(adapterInfoLabel);
 
         busHintLabel.Margin = new Padding(0, 4, 0, 4);
         busHintLabel.MaximumSize = new Size(1320, 0);
-        busHintLabel.Text = "Bus selection separates sessions in the app. Physical line routing is still configured by the Scanmatik driver.";
         connectionPanel.SetFlowBreak(adapterInfoLabel, true);
         connectionPanel.Controls.Add(busHintLabel);
 
         frameGrid.Dock = DockStyle.Fill;
+        frameGrid.Margin = new Padding(0, 0, 0, 8);
         frameGrid.AllowUserToAddRows = false;
         frameGrid.AllowUserToDeleteRows = false;
         frameGrid.AllowUserToResizeRows = false;
@@ -152,9 +213,12 @@ internal sealed class MainForm : Form
         frameGrid.MultiSelect = false;
         frameGrid.RowHeadersVisible = false;
         frameGrid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
-        frameGrid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
+        frameGrid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.None;
+        frameGrid.AutoSizeRowsMode = DataGridViewAutoSizeRowsMode.None;
         frameGrid.BackgroundColor = Color.White;
         frameGrid.BorderStyle = BorderStyle.Fixed3D;
+        frameGrid.ScrollBars = ScrollBars.Both;
+        frameGrid.RowTemplate.Height = 22;
         frameGrid.Columns.Add("Time", "Time");
         frameGrid.Columns.Add("Bus", "Bus");
         frameGrid.Columns.Add("Id", "ID");
@@ -167,26 +231,120 @@ internal sealed class MainForm : Form
         frameGrid.Columns.Add("Count", "Cnt");
         frameGrid.Columns.Add("Period", "Period ms");
         frameGrid.Columns.Add("DriverTs", "Tstamp");
-        frameGrid.Columns[0].FillWeight = 105;
-        frameGrid.Columns[1].FillWeight = 50;
-        frameGrid.Columns[2].FillWeight = 70;
-        frameGrid.Columns[3].FillWeight = 50;
-        frameGrid.Columns[4].FillWeight = 42;
-        for (int index = 5; index < 13; index++)
-        {
-            frameGrid.Columns[index].FillWeight = 42;
-        }
-        frameGrid.Columns[13].FillWeight = 45;
-        frameGrid.Columns[14].FillWeight = 70;
-        frameGrid.Columns[15].FillWeight = 80;
+        ConfigureFrameGridColumns();
         root.Controls.Add(frameGrid, 0, 1);
+
+        GroupBox transmitGroup = new()
+        {
+            Dock = DockStyle.Fill,
+            Text = "Transmit"
+        };
+        root.Controls.Add(transmitGroup, 0, 2);
+
+        TableLayoutPanel transmitRoot = new()
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2,
+            Padding = new Padding(6)
+        };
+        transmitRoot.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+        transmitRoot.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        transmitRoot.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+        transmitGroup.Controls.Add(transmitRoot);
+
+        FlowLayoutPanel transmitPanel = new()
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            Padding = new Padding(4),
+            WrapContents = true
+        };
+        transmitRoot.Controls.Add(transmitPanel, 0, 0);
+
+        transmitPanel.Controls.Add(CreateLabel("ID"));
+        transmitPanel.Controls.Add(txIdTextBox);
+        transmitPanel.Controls.Add(CreateLabel("DLC"));
+        transmitPanel.Controls.Add(txDlcUpDown);
+
+        for (int index = 0; index < txByteTextBoxes.Length; index++)
+        {
+            transmitPanel.Controls.Add(CreateLabel($"D{index}"));
+            transmitPanel.Controls.Add(txByteTextBoxes[index]);
+        }
+
+        transmitPanel.Controls.Add(CreateLabel("Interval ms"));
+        transmitPanel.Controls.Add(txIntervalUpDown);
+        captureRowButton.Margin = new Padding(16, 3, 0, 3);
+        transmitPanel.Controls.Add(captureRowButton);
+        transmitPanel.Controls.Add(addTxButton);
+        transmitPanel.Controls.Add(updateTxButton);
+        transmitPanel.Controls.Add(removeTxButton);
+        transmitPanel.Controls.Add(clearTxListButton);
+        transmitPanel.Controls.Add(loadTxListButton);
+        transmitPanel.Controls.Add(saveTxListButton);
+        transmitPanel.Controls.Add(sendOnceButton);
+        transmitPanel.Controls.Add(sendListButton);
+        transmitPanel.Controls.Add(startTransmitButton);
+        transmitPanel.Controls.Add(stopTransmitButton);
+
+        sweepEnabledCheckBox.Margin = new Padding(20, 7, 0, 0);
+        transmitPanel.Controls.Add(sweepEnabledCheckBox);
+        sweepByteCombo.Items.AddRange(
+        [
+            "D0",
+            "D1",
+            "D2",
+            "D3",
+            "D4",
+            "D5",
+            "D6",
+            "D7"
+        ]);
+        sweepByteCombo.SelectedIndex = 0;
+        transmitPanel.Controls.Add(sweepByteCombo);
+        transmitPanel.Controls.Add(CreateLabel("From"));
+        transmitPanel.Controls.Add(sweepFromTextBox);
+        transmitPanel.Controls.Add(CreateLabel("To"));
+        transmitPanel.Controls.Add(sweepToTextBox);
+        transmitPanel.Controls.Add(CreateLabel("Step"));
+        transmitPanel.Controls.Add(sweepStepTextBox);
+
+        txHintLabel.Margin = new Padding(0, 10, 0, 0);
+        txHintLabel.MaximumSize = new Size(1320, 0);
+        transmitPanel.SetFlowBreak(stopTransmitButton, true);
+        transmitPanel.Controls.Add(txHintLabel);
+
+        txQueueGrid.Dock = DockStyle.Fill;
+        txQueueGrid.AllowUserToAddRows = false;
+        txQueueGrid.AllowUserToDeleteRows = false;
+        txQueueGrid.AllowUserToResizeRows = false;
+        txQueueGrid.ReadOnly = true;
+        txQueueGrid.MultiSelect = false;
+        txQueueGrid.RowHeadersVisible = false;
+        txQueueGrid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
+        txQueueGrid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.None;
+        txQueueGrid.AutoSizeRowsMode = DataGridViewAutoSizeRowsMode.None;
+        txQueueGrid.BackgroundColor = Color.White;
+        txQueueGrid.BorderStyle = BorderStyle.Fixed3D;
+        txQueueGrid.RowTemplate.Height = 22;
+        txQueueGrid.Columns.Add("Seq", "#");
+        txQueueGrid.Columns.Add("Id", "ID");
+        txQueueGrid.Columns.Add("Fmt", "Fmt");
+        txQueueGrid.Columns.Add("Dlc", "DLC");
+        txQueueGrid.Columns.Add("Data", "Data");
+        txQueueGrid.Columns.Add("Interval", "Int ms");
+        txQueueGrid.Columns.Add("Mode", "Mode");
+        ConfigureTransmitQueueGridColumns();
+        transmitRoot.Controls.Add(txQueueGrid, 0, 1);
 
         GroupBox logGroup = new()
         {
             Dock = DockStyle.Fill,
             Text = "CAN Log"
         };
-        root.Controls.Add(logGroup, 0, 2);
+        logGroup.Margin = Padding.Empty;
+        root.Controls.Add(logGroup, 0, 3);
 
         logBox.Dock = DockStyle.Fill;
         logBox.Multiline = true;
@@ -204,12 +362,49 @@ internal sealed class MainForm : Form
         clearButton.Click += (_, _) => ClearActiveBus();
         exportButton.Click += (_, _) => ExportCsv();
         saveIdsButton.Click += (_, _) => SaveIdsToFile();
+        logToggleButton.Click += (_, _) => ToggleFrameLogging();
         filterTextBox.TextChanged += (_, _) => RefreshGrid();
         sortCombo.SelectedIndexChanged += (_, _) => RefreshGrid();
-        busCombo.SelectedIndexChanged += (_, _) => RefreshGrid();
-        driverCombo.SelectedIndexChanged += (_, _) => UpdateAdapterDescription();
+        busCombo.SelectedIndexChanged += (_, _) =>
+        {
+            RefreshGrid();
+            UpdateBusHint();
+            UpdateTransmitHint();
+        };
+        frameFormatCombo.SelectedIndexChanged += (_, _) => UpdateTransmitHint();
+        driverCombo.SelectedIndexChanged += (_, _) =>
+        {
+            UpdateAdapterDescription();
+            UpdateBusHint();
+        };
+        captureRowButton.Click += (_, _) => CaptureSelectedFrameToTransmitPanel(showMessageWhenMissingSelection: true);
+        addTxButton.Click += (_, _) => AddTransmitPlanToQueue();
+        updateTxButton.Click += (_, _) => UpdateSelectedTransmitPlanInQueue();
+        removeTxButton.Click += (_, _) => RemoveSelectedTransmitPlanFromQueue();
+        clearTxListButton.Click += (_, _) => ClearTransmitQueue();
+        loadTxListButton.Click += (_, _) => LoadTransmitQueueFromFile();
+        saveTxListButton.Click += (_, _) => SaveTransmitQueueToFile();
+        sendOnceButton.Click += (_, _) => SendTransmitFrameOnce();
+        sendListButton.Click += (_, _) => SendTransmitQueueOnce();
+        startTransmitButton.Click += (_, _) => StartTransmitLoop();
+        stopTransmitButton.Click += (_, _) => StopTransmitLoop();
+        frameGrid.CellDoubleClick += (_, _) => CaptureSelectedFrameToTransmitPanel(showMessageWhenMissingSelection: false);
+        txQueueGrid.CellDoubleClick += (_, _) => LoadSelectedTransmitPlanIntoEditor();
+        txQueueGrid.SelectionChanged += (_, _) => UpdateTransmitButtonState();
         uiTimer.Tick += (_, _) => DrainPendingFrames();
+        transmitTimer.Tick += (_, _) => HandleTransmitTimerTick();
         FormClosing += async (_, _) => await DisconnectAsync();
+
+        txDlcUpDown.ValueChanged += (_, _) => ApplyTransmitDlcState();
+        sweepEnabledCheckBox.CheckedChanged += (_, _) => UpdateTransmitHint();
+        foreach (TextBox box in txByteTextBoxes)
+        {
+            box.Leave += (_, _) => NormalizeHexByteTextBox(box);
+        }
+
+        sweepFromTextBox.Leave += (_, _) => NormalizeHexByteTextBox(sweepFromTextBox);
+        sweepToTextBox.Leave += (_, _) => NormalizeHexByteTextBox(sweepToTextBox);
+        sweepStepTextBox.Leave += (_, _) => NormalizeHexByteTextBox(sweepStepTextBox, fallbackValue: "01");
     }
 
     private void EnsureBusWorkspaces()
@@ -257,6 +452,7 @@ internal sealed class MainForm : Form
         if (driver is null)
         {
             adapterInfoLabel.Text = "J2534 registry is empty. Scanmatik SM2/SM3 must be installed with PassThru support.";
+            busHintLabel.Text = "Physical CAN routing is unavailable until a Scanmatik J2534 driver is selected.";
             configButton.Enabled = false;
             return;
         }
@@ -272,6 +468,221 @@ internal sealed class MainForm : Form
         builder.Append(" | Build target: x86");
         adapterInfoLabel.Text = builder.ToString();
         configButton.Enabled = !string.IsNullOrWhiteSpace(driver.ConfigApplication) && File.Exists(driver.ConfigApplication);
+    }
+
+    private void UpdateBusHint()
+    {
+        BusProfileOption selectedBus = (busCombo.SelectedItem as BusProfileOption) ?? busOptions[0];
+        PassThruDriverInfo? driver = driverCombo.SelectedItem as PassThruDriverInfo;
+
+        StringBuilder builder = new();
+        builder.Append("Physical bus route: ").Append(FormatBusProfileLabel(selectedBus)).Append(". ");
+        builder.Append(selectedBus.UsesDefaultCanChannel
+            ? "This route uses the standard J2534 CAN channel on pins 6-14."
+            : "This route uses J2534-2 CAN_PS with J1962_PINS switching.");
+
+        if (selectedBus.Name == "CAN3")
+        {
+            builder.Append(" CAN3 is mapped as 12H-13L in this build.");
+        }
+
+        if (driver is not null &&
+            driver.DisplayName.Contains("SM2", StringComparison.OrdinalIgnoreCase) &&
+            !driver.DisplayName.Contains("SM3", StringComparison.OrdinalIgnoreCase))
+        {
+            builder.Append(" The SM2 driver name does not show whether the hardware is SM2 or SM2-PRO.");
+            builder.Append(" Officially: plain SM2 supports CAN1 6-14 and CAN2 3-11; CAN3 12-13 needs SM2-PRO/SM3; CAN4 1-9 and CAN5 2-10 are SM3-class routes.");
+        }
+        else
+        {
+            builder.Append(" Official Scanmatik CAN routes include 6-14, 3-11, 12-13, 1-9, and 2-10 depending on hardware.");
+        }
+
+        busHintLabel.Text = builder.ToString();
+    }
+
+    private void ConfigureFrameGridColumns()
+    {
+        int[] widths =
+        [
+            110,
+            60,
+            78,
+            46,
+            46,
+            52,
+            52,
+            52,
+            52,
+            52,
+            52,
+            52,
+            52,
+            58,
+            82,
+            92
+        ];
+
+        for (int index = 0; index < widths.Length && index < frameGrid.Columns.Count; index++)
+        {
+            frameGrid.Columns[index].Width = widths[index];
+            frameGrid.Columns[index].SortMode = DataGridViewColumnSortMode.NotSortable;
+        }
+    }
+
+    private void ConfigureTransmitQueueGridColumns()
+    {
+        int[] widths =
+        [
+            36,
+            86,
+            46,
+            46,
+            420,
+            64,
+            170
+        ];
+
+        for (int index = 0; index < widths.Length && index < txQueueGrid.Columns.Count; index++)
+        {
+            txQueueGrid.Columns[index].Width = widths[index];
+            txQueueGrid.Columns[index].SortMode = DataGridViewColumnSortMode.NotSortable;
+        }
+    }
+
+    private void ApplyTransmitDlcState()
+    {
+        bool isLoopRunning = activeTransmitPlan is not null || activeTransmitSequence is not null;
+        int dlc = Decimal.ToInt32(txDlcUpDown.Value);
+        for (int index = 0; index < txByteTextBoxes.Length; index++)
+        {
+            TextBox box = txByteTextBoxes[index];
+            bool withinDlc = index < dlc;
+            box.Enabled = !isLoopRunning && withinDlc;
+            box.BackColor = withinDlc ? Color.White : Color.Gainsboro;
+            if (string.IsNullOrWhiteSpace(box.Text))
+            {
+                box.Text = "00";
+            }
+        }
+
+        sweepByteCombo.Enabled = !isLoopRunning && sweepEnabledCheckBox.Checked;
+        sweepFromTextBox.Enabled = !isLoopRunning && sweepEnabledCheckBox.Checked;
+        sweepToTextBox.Enabled = !isLoopRunning && sweepEnabledCheckBox.Checked;
+        sweepStepTextBox.Enabled = !isLoopRunning && sweepEnabledCheckBox.Checked;
+    }
+
+    private void UpdateTransmitHint()
+    {
+        bool useExtendedIdentifiers = (frameFormatCombo.SelectedItem as FrameFormatOption)?.UseExtendedIdentifiers ?? false;
+        string formatText = useExtendedIdentifiers ? "29-bit" : "11-bit";
+        string busText = FormatBusProfileLabel((busCombo.SelectedItem as BusProfileOption) ?? busOptions[0]);
+        string stateText = api is null
+            ? "Connect first to send frames."
+            : $"TX uses the current live CAN connection on {busText}.";
+        txHintLabel.Text = $"{stateText} Current TX format: {formatText}. Add TX stores the editor frame into the list. If the list is not empty, Start TX cycles through the whole list. Sweep wraps From/To on the selected byte.";
+        ApplyTransmitDlcState();
+    }
+
+    private void UpdateTransmitButtonState()
+    {
+        bool isConnected = api is not null;
+        bool isLoopRunning = activeTransmitPlan is not null || activeTransmitSequence is not null;
+        bool hasQueue = transmitQueue.Count > 0;
+        bool hasQueueSelection = txQueueGrid.SelectedRows.Count > 0;
+
+        txIdTextBox.Enabled = !isLoopRunning;
+        txDlcUpDown.Enabled = !isLoopRunning;
+        txIntervalUpDown.Enabled = !isLoopRunning;
+        sweepEnabledCheckBox.Enabled = !isLoopRunning;
+        captureRowButton.Enabled = !isLoopRunning && frameGrid.Rows.Count > 0;
+        addTxButton.Enabled = !isLoopRunning;
+        updateTxButton.Enabled = !isLoopRunning && hasQueueSelection;
+        removeTxButton.Enabled = !isLoopRunning && hasQueueSelection;
+        clearTxListButton.Enabled = !isLoopRunning && hasQueue;
+        loadTxListButton.Enabled = !isLoopRunning;
+        saveTxListButton.Enabled = !isLoopRunning && hasQueue;
+        sendOnceButton.Enabled = isConnected && !isLoopRunning;
+        sendListButton.Enabled = isConnected && !isLoopRunning && hasQueue;
+        startTransmitButton.Enabled = isConnected && !isLoopRunning;
+        stopTransmitButton.Enabled = isLoopRunning;
+        ApplyTransmitDlcState();
+    }
+
+    private void UpdateLogButtonState()
+    {
+        bool isConnected = api is not null;
+        logToggleButton.Enabled = isConnected || sessionLogWriter is not null;
+        logToggleButton.Text = sessionLogWriter is null ? "Start Log" : "Stop Log";
+    }
+
+    private void ResetReceiveIndicator()
+    {
+        totalReceivedFrames = 0;
+        lastReceivedAtUtc = DateTime.MinValue;
+        lastReceivedSummary = null;
+        rxInfoLabel.Text = "RX: 0";
+    }
+
+    private void UpdateReceiveIndicator(int receivedFrames, string busName, CanFrame lastFrame)
+    {
+        totalReceivedFrames += receivedFrames;
+        lastReceivedAtUtc = lastFrame.ReceivedAtUtc;
+        lastReceivedSummary = $"{busName} {FormatId(lastFrame.Id, lastFrame.IsExtended)} [{lastFrame.Dlc}]";
+        rxInfoLabel.Text = $"RX: {totalReceivedFrames.ToString(CultureInfo.InvariantCulture)} | Last: {lastReceivedAtUtc.ToLocalTime():HH:mm:ss.fff} {lastReceivedSummary}";
+    }
+
+    private void ToggleFrameLogging()
+    {
+        if (sessionLogWriter is not null)
+        {
+            AppendLog("LOG   stopped");
+            StopSessionLog();
+            UpdateLogButtonState();
+            return;
+        }
+
+        if (api is null)
+        {
+            MessageBox.Show(this, "Connect to the CAN bus before starting the log.", "CanScanmatik", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        StartSessionLog();
+        UpdateLogButtonState();
+    }
+
+    private void ClearConnectionDetails()
+    {
+        connectedDriver = null;
+        connectedBitrate = null;
+        connectedFrameFormat = null;
+        connectedBusProfile = null;
+        connectedFirmwareVersion = null;
+        connectedDllVersion = null;
+        connectedApiVersion = null;
+    }
+
+    private static string FormatBusProfileLabel(BusProfileOption busProfile)
+    {
+        return busProfile.DisplayName;
+    }
+
+    private FrameSnapshot? GetSelectedFrameSnapshot()
+    {
+        if (frameGrid.SelectedRows.Count == 0)
+        {
+            return null;
+        }
+
+        string? key = frameGrid.SelectedRows[0].Tag as string;
+        if (string.IsNullOrWhiteSpace(key))
+        {
+            return null;
+        }
+
+        BusWorkspace workspace = GetOrCreateWorkspace(GetSelectedBusName());
+        return workspace.Frames.TryGetValue(key, out FrameSnapshot? snapshot) ? snapshot : null;
     }
 
     private async Task ToggleConnectionAsync()
@@ -318,20 +729,31 @@ internal sealed class MainForm : Form
         {
             newApi = new PassThruApi(driver);
             (string firmwareVersion, string dllVersion, string apiVersion) = newApi.OpenAndReadVersion();
-            newApi.ConnectCan(bitrate.BaudRate, frameFormat.UseExtendedIdentifiers);
+            newApi.ConnectCan(bitrate.BaudRate, frameFormat.UseExtendedIdentifiers, busProfile.GetConnectPins());
 
             api = newApi;
             activeConnectionBusName = busProfile.Name;
+            connectedDriver = driver;
+            connectedBitrate = bitrate;
+            connectedFrameFormat = frameFormat;
+            connectedBusProfile = busProfile;
+            connectedFirmwareVersion = firmwareVersion;
+            connectedDllVersion = dllVersion;
+            connectedApiVersion = apiVersion;
+            ResetReceiveIndicator();
             readLoopCancellation = new CancellationTokenSource();
             readLoopTask = Task.Run(() => ReadLoopAsync(newApi, activeConnectionBusName, readLoopCancellation.Token));
-            StartSessionLog(driver, busProfile, bitrate, frameFormat, firmwareVersion, dllVersion, apiVersion);
             uiTimer.Start();
+            UpdateTransmitHint();
+            UpdateTransmitButtonState();
+            UpdateLogButtonState();
 
             connectButton.Text = "Disconnect";
-            statusLabel.Text = $"Connected: {driver.DisplayName} | {busProfile.Name} | {bitrate.DisplayName} | {(frameFormat.UseExtendedIdentifiers ? "29-bit" : "11-bit")}";
+            statusLabel.Text = $"Connected: {driver.DisplayName} | {FormatBusProfileLabel(busProfile)} | {bitrate.DisplayName} | {(frameFormat.UseExtendedIdentifiers ? "29-bit" : "11-bit")}";
             adapterInfoLabel.Text = $"Firmware: {firmwareVersion} | DLL: {dllVersion} | API: {apiVersion} | {driver.FunctionLibrary}";
             AppendLog($"OPEN  {driver.DisplayName}");
-            AppendLog($"BUS   {busProfile.Name}");
+            AppendLog($"BUS   {FormatBusProfileLabel(busProfile)}");
+            AppendLog($"ROUTE {(busProfile.UsesDefaultCanChannel ? "base CAN" : "CAN_PS")} -> {busProfile.PinDisplay}");
             AppendLog($"LINK  {bitrate.DisplayName}, {(frameFormat.UseExtendedIdentifiers ? "extended 29-bit" : "standard 11-bit")}");
         }
         catch (Exception ex)
@@ -339,9 +761,10 @@ internal sealed class MainForm : Form
             newApi?.Dispose();
             api = null;
             activeConnectionBusName = null;
+            ClearConnectionDetails();
             StopSessionLog();
             statusLabel.Text = "Connection failed.";
-            MessageBox.Show(this, ex.Message, "Scanmatik / J2534 Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            MessageBox.Show(this, BuildConnectionErrorMessage(ex, busProfile), "Scanmatik / J2534 Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             RestoreControlsAfterDisconnect();
         }
         finally
@@ -356,6 +779,7 @@ internal sealed class MainForm : Form
     private async Task DisconnectAsync()
     {
         uiTimer.Stop();
+        StopTransmitLoop();
 
         CancellationTokenSource? cancellation = readLoopCancellation;
         Task? readTask = readLoopTask;
@@ -388,6 +812,7 @@ internal sealed class MainForm : Form
         api?.Dispose();
         api = null;
         activeConnectionBusName = null;
+        ClearConnectionDetails();
         StopSessionLog();
         RestoreControlsAfterDisconnect();
     }
@@ -398,7 +823,7 @@ internal sealed class MainForm : Form
         {
             while (!cancellationToken.IsCancellationRequested)
             {
-                IReadOnlyList<CanFrame> frames = currentApi.ReadCanFrames(timeoutMs: 100, batchSize: 32);
+                IReadOnlyList<CanFrame> frames = currentApi.ReadCanFrames(timeoutMs: ReadLoopTimeoutMs, batchSize: ReadLoopBatchSize);
                 foreach (CanFrame frame in frames)
                 {
                     pendingFrames.Enqueue(new QueuedFrame(busName, frame));
@@ -411,7 +836,7 @@ internal sealed class MainForm : Form
 
                 if (frames.Count == 0)
                 {
-                    await Task.Delay(10, cancellationToken).ConfigureAwait(false);
+                    await Task.Delay(ReadLoopIdleDelayMs, cancellationToken).ConfigureAwait(false);
                 }
             }
         }
@@ -437,17 +862,37 @@ internal sealed class MainForm : Form
 
         string activeBusName = GetSelectedBusName();
         HashSet<string> changedKeys = new(StringComparer.OrdinalIgnoreCase);
+        bool captureFrameTrace = sessionLogWriter is not null;
+        StringBuilder? logBatchBuilder = null;
         int processed = 0;
+        CanFrame? lastProcessedFrame = null;
+        string? lastProcessedBusName = null;
 
         while (processed < GridRefreshBatchSize && pendingFrames.TryDequeue(out QueuedFrame queuedFrame))
         {
             processed++;
             UpdateSnapshot(queuedFrame.BusName, queuedFrame.Frame);
-            AppendFrameLog(queuedFrame.BusName, queuedFrame.Frame);
+            lastProcessedFrame = queuedFrame.Frame;
+            lastProcessedBusName = queuedFrame.BusName;
+            if (captureFrameTrace)
+            {
+                logBatchBuilder ??= new StringBuilder(GridRefreshBatchSize * 32);
+                AppendFrameLog(logBatchBuilder, queuedFrame.BusName, queuedFrame.Frame);
+            }
             if (string.Equals(queuedFrame.BusName, activeBusName, StringComparison.OrdinalIgnoreCase))
             {
                 changedKeys.Add(GetFrameKey(queuedFrame.Frame.Id, queuedFrame.Frame.IsExtended));
             }
+        }
+
+        if (logBatchBuilder is not null && logBatchBuilder.Length > 0)
+        {
+            AppendSessionLogText(logBatchBuilder.ToString());
+        }
+
+        if (processed > 0 && lastProcessedFrame.HasValue && !string.IsNullOrWhiteSpace(lastProcessedBusName))
+        {
+            UpdateReceiveIndicator(processed, lastProcessedBusName!, lastProcessedFrame.Value);
         }
 
         if (changedKeys.Count > 0)
@@ -552,6 +997,7 @@ internal sealed class MainForm : Form
         }
 
         frameGrid.ResumeLayout();
+        UpdateTransmitButtonState();
     }
 
     private void ClearActiveBus()
@@ -562,6 +1008,513 @@ internal sealed class MainForm : Form
         frameGrid.Rows.Clear();
         logBox.Clear();
         AppendLog($"CLEAR {workspace.Name}");
+        UpdateTransmitButtonState();
+    }
+
+    private void AddTransmitPlanToQueue()
+    {
+        if (!TryBuildTransmitPlan(out TransmitPlan? plan, requireConnection: false))
+        {
+            return;
+        }
+
+        transmitQueue.Add(plan!);
+        RefreshTransmitQueueGrid();
+        txQueueGrid.ClearSelection();
+        txQueueGrid.Rows[^1].Selected = true;
+        AppendLog($"TXADD {FormatId(plan!.Id, plan.UseExtendedIdentifiers)}");
+    }
+
+    private void UpdateSelectedTransmitPlanInQueue()
+    {
+        if (!TryBuildTransmitPlan(out TransmitPlan? plan, requireConnection: false))
+        {
+            return;
+        }
+
+        int index = GetSelectedTransmitQueueIndex();
+        if (index < 0)
+        {
+            MessageBox.Show(this, "Select a TX row from the list first.", "CanScanmatik", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        transmitQueue[index] = plan!;
+        RefreshTransmitQueueGrid();
+        txQueueGrid.ClearSelection();
+        txQueueGrid.Rows[index].Selected = true;
+        AppendLog($"TXUPD {FormatId(plan!.Id, plan.UseExtendedIdentifiers)}");
+    }
+
+    private void RemoveSelectedTransmitPlanFromQueue()
+    {
+        int index = GetSelectedTransmitQueueIndex();
+        if (index < 0)
+        {
+            MessageBox.Show(this, "Select a TX row from the list first.", "CanScanmatik", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        TransmitPlan removed = transmitQueue[index];
+        transmitQueue.RemoveAt(index);
+        RefreshTransmitQueueGrid();
+        AppendLog($"TXDEL {FormatId(removed.Id, removed.UseExtendedIdentifiers)}");
+    }
+
+    private void ClearTransmitQueue()
+    {
+        if (transmitQueue.Count == 0)
+        {
+            return;
+        }
+
+        transmitQueue.Clear();
+        RefreshTransmitQueueGrid();
+        AppendLog("TXCLR list");
+    }
+
+    private void SaveTransmitQueueToFile()
+    {
+        if (transmitQueue.Count == 0)
+        {
+            MessageBox.Show(this, "The TX list is empty.", "CanScanmatik", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        using SaveFileDialog dialog = new()
+        {
+            Filter = "TX list (*.json)|*.json|All files (*.*)|*.*",
+            FileName = $"tx_list_{DateTime.Now:yyyyMMdd_HHmmss}.json",
+            Title = "Save TX list"
+        };
+
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        List<TransmitPlanFileModel> fileModels = transmitQueue
+            .Select(static item => TransmitPlanFileModel.FromPlan(item))
+            .ToList();
+
+        JsonSerializerOptions options = new()
+        {
+            WriteIndented = true
+        };
+
+        string json = JsonSerializer.Serialize(fileModels, options);
+        File.WriteAllText(dialog.FileName, json, new UTF8Encoding(false));
+        AppendLog($"TXSAVE {dialog.FileName}");
+    }
+
+    private void LoadTransmitQueueFromFile()
+    {
+        using OpenFileDialog dialog = new()
+        {
+            Filter = "TX list (*.json)|*.json|All files (*.*)|*.*",
+            Title = "Load TX list"
+        };
+
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        try
+        {
+            string json = File.ReadAllText(dialog.FileName, Encoding.UTF8);
+            List<TransmitPlanFileModel>? fileModels = JsonSerializer.Deserialize<List<TransmitPlanFileModel>>(json);
+            if (fileModels is null || fileModels.Count == 0)
+            {
+                MessageBox.Show(this, "The selected file does not contain any TX frames.", "CanScanmatik", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            transmitQueue.Clear();
+            foreach (TransmitPlanFileModel fileModel in fileModels)
+            {
+                transmitQueue.Add(fileModel.ToPlan());
+            }
+
+            RefreshTransmitQueueGrid();
+            txQueueGrid.ClearSelection();
+            txQueueGrid.Rows[0].Selected = true;
+            LoadTransmitPlanIntoEditor(transmitQueue[0]);
+            AppendLog($"TXLOAD {dialog.FileName}");
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, ex.Message, "Unable to load TX list", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private void LoadSelectedTransmitPlanIntoEditor()
+    {
+        if (activeTransmitPlan is not null || activeTransmitSequence is not null)
+        {
+            return;
+        }
+
+        int index = GetSelectedTransmitQueueIndex();
+        if (index < 0)
+        {
+            return;
+        }
+
+        LoadTransmitPlanIntoEditor(transmitQueue[index]);
+    }
+
+    private void LoadTransmitPlanIntoEditor(TransmitPlan plan)
+    {
+        if (frameFormatCombo.Enabled)
+        {
+            frameFormatCombo.SelectedIndex = plan.UseExtendedIdentifiers ? 1 : 0;
+        }
+
+        txIdTextBox.Text = FormatId(plan.Id, plan.UseExtendedIdentifiers);
+        txDlcUpDown.Value = plan.Dlc;
+        for (int index = 0; index < VisibleByteColumns; index++)
+        {
+            txByteTextBoxes[index].Text = index < plan.Data.Length
+                ? plan.Data[index].ToString("X2", CultureInfo.InvariantCulture)
+                : "00";
+        }
+
+        txIntervalUpDown.Value = Math.Clamp(plan.IntervalMs, Decimal.ToInt32(txIntervalUpDown.Minimum), Decimal.ToInt32(txIntervalUpDown.Maximum));
+        sweepEnabledCheckBox.Checked = plan.SweepEnabled;
+        sweepByteCombo.SelectedIndex = plan.SweepByteIndex;
+        sweepFromTextBox.Text = plan.SweepFrom.ToString("X2", CultureInfo.InvariantCulture);
+        sweepToTextBox.Text = plan.SweepTo.ToString("X2", CultureInfo.InvariantCulture);
+        sweepStepTextBox.Text = plan.SweepStep.ToString("X2", CultureInfo.InvariantCulture);
+        ApplyTransmitDlcState();
+        UpdateTransmitHint();
+    }
+
+    private void RefreshTransmitQueueGrid()
+    {
+        txQueueGrid.SuspendLayout();
+        txQueueGrid.Rows.Clear();
+
+        for (int index = 0; index < transmitQueue.Count; index++)
+        {
+            TransmitPlan plan = transmitQueue[index];
+            txQueueGrid.Rows.Add(
+                (index + 1).ToString(CultureInfo.InvariantCulture),
+                FormatId(plan.Id, plan.UseExtendedIdentifiers),
+                plan.UseExtendedIdentifiers ? "29" : "11",
+                plan.Dlc.ToString(CultureInfo.InvariantCulture),
+                FormatTransmitData(plan),
+                plan.IntervalMs.ToString(CultureInfo.InvariantCulture),
+                BuildTransmitModeSummary(plan));
+        }
+
+        txQueueGrid.ResumeLayout();
+        UpdateTransmitButtonState();
+    }
+
+    private void SendTransmitQueueOnce()
+    {
+        if (api is null)
+        {
+            MessageBox.Show(this, "Connect to the CAN bus before transmitting.", "CanScanmatik", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        if (transmitQueue.Count == 0)
+        {
+            MessageBox.Show(this, "The TX list is empty.", "CanScanmatik", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        try
+        {
+            foreach (TransmitPlan plan in transmitQueue.Select(static item => item.Clone()))
+            {
+                plan.ResetRuntimeState();
+                SendTransmitFrame(plan, useSweepValue: plan.SweepEnabled);
+            }
+
+            AppendLog($"TXALL {transmitQueue.Count.ToString(CultureInfo.InvariantCulture)} frames");
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, ex.Message, "CAN Transmit Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private int GetSelectedTransmitQueueIndex()
+    {
+        return txQueueGrid.SelectedRows.Count == 0 ? -1 : txQueueGrid.SelectedRows[0].Index;
+    }
+
+    private void SendTransmitFrameOnce()
+    {
+        if (!TryBuildTransmitPlan(out TransmitPlan? plan))
+        {
+            return;
+        }
+
+        try
+        {
+            SendTransmitFrame(plan!, useSweepValue: false);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, ex.Message, "CAN Transmit Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private void StartTransmitLoop()
+    {
+        if (activeTransmitPlan is not null || activeTransmitSequence is not null)
+        {
+            return;
+        }
+
+        if (transmitQueue.Count > 0)
+        {
+            activeTransmitSequence = transmitQueue.Select(static item => item.Clone()).ToList();
+            foreach (TransmitPlan plan in activeTransmitSequence)
+            {
+                plan.ResetRuntimeState();
+            }
+
+            activeTransmitSequenceIndex = 0;
+            transmitTimer.Interval = activeTransmitSequence[0].IntervalMs;
+            transmitTimer.Start();
+            UpdateTransmitButtonState();
+
+            try
+            {
+                TransmitPlan plan = activeTransmitSequence[activeTransmitSequenceIndex];
+                SendTransmitFrame(plan, useSweepValue: plan.SweepEnabled);
+                AdvanceActiveTransmitSequence();
+                AppendLog($"TXRUN list {activeTransmitSequence.Count.ToString(CultureInfo.InvariantCulture)} frames");
+            }
+            catch (Exception ex)
+            {
+                StopTransmitLoop();
+                MessageBox.Show(this, ex.Message, "CAN Transmit Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+
+            return;
+        }
+
+        if (!TryBuildTransmitPlan(out TransmitPlan? singlePlan))
+        {
+            return;
+        }
+
+        TransmitPlan activeSinglePlan = singlePlan!;
+        activeTransmitPlan = activeSinglePlan;
+        activeSinglePlan.ResetRuntimeState();
+        transmitTimer.Interval = activeSinglePlan.IntervalMs;
+        transmitTimer.Start();
+        UpdateTransmitButtonState();
+
+        try
+        {
+            SendTransmitFrame(activeSinglePlan, useSweepValue: activeSinglePlan.SweepEnabled);
+            AppendLog($"TXRUN {GetSelectedBusName(),-4}  every {activeSinglePlan.IntervalMs.ToString(CultureInfo.InvariantCulture)} ms");
+        }
+        catch (Exception ex)
+        {
+            StopTransmitLoop();
+            MessageBox.Show(this, ex.Message, "CAN Transmit Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private void StopTransmitLoop()
+    {
+        bool hadActiveLoop = activeTransmitPlan is not null || activeTransmitSequence is not null;
+        transmitTimer.Stop();
+        activeTransmitPlan = null;
+        activeTransmitSequence = null;
+        activeTransmitSequenceIndex = 0;
+        UpdateTransmitButtonState();
+
+        if (hadActiveLoop)
+        {
+            AppendLog($"TXSTOP {GetSelectedBusName(),-4}");
+        }
+    }
+
+    private void HandleTransmitTimerTick()
+    {
+        if (activeTransmitSequence is null && activeTransmitPlan is null)
+        {
+            transmitTimer.Stop();
+            UpdateTransmitButtonState();
+            return;
+        }
+
+        try
+        {
+            if (activeTransmitSequence is not null)
+            {
+                TransmitPlan plan = activeTransmitSequence[activeTransmitSequenceIndex];
+                SendTransmitFrame(plan, useSweepValue: plan.SweepEnabled);
+                AdvanceActiveTransmitSequence();
+            }
+            else if (activeTransmitPlan is not null)
+            {
+                SendTransmitFrame(activeTransmitPlan, useSweepValue: activeTransmitPlan.SweepEnabled);
+            }
+        }
+        catch (Exception ex)
+        {
+            StopTransmitLoop();
+            MessageBox.Show(this, ex.Message, "CAN Transmit Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private void SendTransmitFrame(TransmitPlan plan, bool useSweepValue)
+    {
+        PassThruApi currentApi = api ?? throw new InvalidOperationException("Connect to the CAN bus before transmitting.");
+
+        byte[] payload = plan.Data.ToArray();
+        string? sweepSuffix = null;
+        if (useSweepValue && plan.SweepEnabled)
+        {
+            payload[plan.SweepByteIndex] = (byte)plan.CurrentSweepValue;
+            txByteTextBoxes[plan.SweepByteIndex].Text = payload[plan.SweepByteIndex].ToString("X2", CultureInfo.InvariantCulture);
+            sweepSuffix = $"  sweep D{plan.SweepByteIndex}={payload[plan.SweepByteIndex].ToString("X2", CultureInfo.InvariantCulture)}";
+            plan.CurrentSweepValue = GetNextSweepValue(plan, plan.CurrentSweepValue);
+        }
+
+        currentApi.WriteCanFrame(plan.Id, plan.UseExtendedIdentifiers, payload, plan.Dlc, timeoutMs: 50);
+        AppendTransmitLog(plan, payload, sweepSuffix);
+    }
+
+    private void AdvanceActiveTransmitSequence()
+    {
+        if (activeTransmitSequence is null || activeTransmitSequence.Count == 0)
+        {
+            return;
+        }
+
+        activeTransmitSequenceIndex++;
+        if (activeTransmitSequenceIndex >= activeTransmitSequence.Count)
+        {
+            activeTransmitSequenceIndex = 0;
+        }
+
+        transmitTimer.Interval = activeTransmitSequence[activeTransmitSequenceIndex].IntervalMs;
+    }
+
+    private static int GetNextSweepValue(TransmitPlan plan, int currentValue)
+    {
+        if (!plan.SweepEnabled)
+        {
+            return currentValue;
+        }
+
+        if (plan.SweepFrom <= plan.SweepTo)
+        {
+            int nextValue = currentValue + plan.SweepStep;
+            return nextValue > plan.SweepTo ? plan.SweepFrom : nextValue;
+        }
+
+        int descendingValue = currentValue - plan.SweepStep;
+        return descendingValue < plan.SweepTo ? plan.SweepFrom : descendingValue;
+    }
+
+    private void AppendTransmitLog(TransmitPlan plan, byte[] payload, string? sweepSuffix)
+    {
+        string dataText = plan.Dlc == 0
+            ? "-"
+            : string.Join(' ', payload.Take(plan.Dlc).Select(static value => value.ToString("X2", CultureInfo.InvariantCulture)));
+
+        AppendLog($"TX    {GetSelectedBusName(),-4}  {FormatId(plan.Id, plan.UseExtendedIdentifiers),-8}  [{plan.Dlc}]  {dataText}{sweepSuffix}");
+    }
+
+    private bool TryBuildTransmitPlan(out TransmitPlan? plan, bool requireConnection = true)
+    {
+        plan = null;
+        if (requireConnection && api is null)
+        {
+            MessageBox.Show(this, "Connect to the CAN bus before transmitting.", "CanScanmatik", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return false;
+        }
+
+        FrameFormatOption? frameFormat = frameFormatCombo.SelectedItem as FrameFormatOption;
+        bool useExtendedIdentifiers = frameFormat?.UseExtendedIdentifiers ?? false;
+        if (!TryParseIdentifier(txIdTextBox.Text, useExtendedIdentifiers, out uint identifier))
+        {
+            string formatExample = useExtendedIdentifiers ? "18DAF110" : "208";
+            MessageBox.Show(this, $"Invalid CAN ID. Expected hex like {formatExample}.", "CanScanmatik", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            txIdTextBox.Focus();
+            txIdTextBox.SelectAll();
+            return false;
+        }
+
+        int dlc = Decimal.ToInt32(txDlcUpDown.Value);
+        byte[] data = new byte[VisibleByteColumns];
+        for (int index = 0; index < VisibleByteColumns; index++)
+        {
+            if (!TryParseHexByte(txByteTextBoxes[index].Text, out data[index]))
+            {
+                MessageBox.Show(this, $"Invalid value in D{index}. Use hex bytes from 00 to FF.", "CanScanmatik", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                txByteTextBoxes[index].Focus();
+                txByteTextBoxes[index].SelectAll();
+                return false;
+            }
+        }
+
+        bool sweepEnabled = sweepEnabledCheckBox.Checked;
+        int sweepByteIndex = sweepByteCombo.SelectedIndex >= 0 ? sweepByteCombo.SelectedIndex : 0;
+        byte sweepFrom = 0;
+        byte sweepTo = 0;
+        byte sweepStep = 1;
+
+        if (sweepEnabled)
+        {
+            if (sweepByteIndex >= dlc)
+            {
+                MessageBox.Show(this, "Sweep byte must be inside the selected DLC.", "CanScanmatik", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                sweepByteCombo.Focus();
+                return false;
+            }
+
+            if (!TryParseHexByte(sweepFromTextBox.Text, out sweepFrom) ||
+                !TryParseHexByte(sweepToTextBox.Text, out sweepTo) ||
+                !TryParseHexByte(sweepStepTextBox.Text, out sweepStep) ||
+                sweepStep == 0)
+            {
+                MessageBox.Show(this, "Sweep expects valid hex values in From / To / Step. Step cannot be 00.", "CanScanmatik", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                sweepFromTextBox.Focus();
+                sweepFromTextBox.SelectAll();
+                return false;
+            }
+        }
+
+        int intervalMs = Decimal.ToInt32(txIntervalUpDown.Value);
+        plan = new TransmitPlan(identifier, useExtendedIdentifiers, dlc, data, intervalMs, sweepEnabled, sweepByteIndex, sweepFrom, sweepTo, sweepStep);
+        plan.ResetRuntimeState();
+        return true;
+    }
+
+    private void CaptureSelectedFrameToTransmitPanel(bool showMessageWhenMissingSelection)
+    {
+        if (activeTransmitPlan is not null || activeTransmitSequence is not null)
+        {
+            return;
+        }
+
+        FrameSnapshot? snapshot = GetSelectedFrameSnapshot();
+        if (snapshot is null)
+        {
+            if (showMessageWhenMissingSelection)
+            {
+                MessageBox.Show(this, "Select a row in the CAN table first.", "CanScanmatik", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+
+            return;
+        }
+
+        TransmitPlan capturedPlan = new(snapshot.Id, snapshot.IsExtended, Math.Clamp(snapshot.Dlc, 0, VisibleByteColumns), BuildCaptureData(snapshot.Data), 100, false, 0, 0x00, 0xFF, 0x01);
+        LoadTransmitPlanIntoEditor(capturedPlan);
+        AppendLog($"TXCAP {snapshot.BusName,-4}  {FormatId(snapshot.Id, snapshot.IsExtended)}");
     }
 
     private void ExportCsv()
@@ -698,26 +1651,31 @@ internal sealed class MainForm : Form
         }
     }
 
-    private void StartSessionLog(PassThruDriverInfo driver, BusProfileOption busProfile, BitrateOption bitrate, FrameFormatOption frameFormat, string firmwareVersion, string dllVersion, string apiVersion)
+    private void StartSessionLog()
     {
         StopSessionLog();
 
+        if (connectedDriver is null || connectedBitrate is null || connectedFrameFormat is null || connectedBusProfile is null)
+        {
+            return;
+        }
+
         string logsDirectory = Path.Combine(AppContext.BaseDirectory, "logs");
         Directory.CreateDirectory(logsDirectory);
-        sessionLogFilePath = Path.Combine(logsDirectory, $"{busProfile.Name}_{DateTime.Now:yyyyMMdd_HHmmss}.log");
+        sessionLogFilePath = Path.Combine(logsDirectory, $"{connectedBusProfile.Name}_{DateTime.Now:yyyyMMdd_HHmmss}.log");
         sessionLogWriter = new StreamWriter(sessionLogFilePath, append: false, new UTF8Encoding(false))
         {
             AutoFlush = true
         };
 
         sessionLogWriter.WriteLine($"# Start: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
-        sessionLogWriter.WriteLine($"# Adapter: {driver.DisplayName}");
-        sessionLogWriter.WriteLine($"# Bus: {busProfile.Name}");
-        sessionLogWriter.WriteLine($"# Bitrate: {bitrate.DisplayName}");
-        sessionLogWriter.WriteLine($"# Frames: {(frameFormat.UseExtendedIdentifiers ? "29-bit" : "11-bit")}");
-        sessionLogWriter.WriteLine($"# Firmware: {firmwareVersion}");
-        sessionLogWriter.WriteLine($"# DLL: {dllVersion}");
-        sessionLogWriter.WriteLine($"# API: {apiVersion}");
+        sessionLogWriter.WriteLine($"# Adapter: {connectedDriver.DisplayName}");
+        sessionLogWriter.WriteLine($"# Bus: {FormatBusProfileLabel(connectedBusProfile)}");
+        sessionLogWriter.WriteLine($"# Bitrate: {connectedBitrate.DisplayName}");
+        sessionLogWriter.WriteLine($"# Frames: {(connectedFrameFormat.UseExtendedIdentifiers ? "29-bit" : "11-bit")}");
+        sessionLogWriter.WriteLine($"# Firmware: {connectedFirmwareVersion}");
+        sessionLogWriter.WriteLine($"# DLL: {connectedDllVersion}");
+        sessionLogWriter.WriteLine($"# API: {connectedApiVersion}");
         sessionLogWriter.WriteLine();
         AppendLog($"LOG   {sessionLogFilePath}");
     }
@@ -738,6 +1696,7 @@ internal sealed class MainForm : Form
 
         sessionLogWriter = null;
         sessionLogFilePath = null;
+        UpdateLogButtonState();
     }
 
     private void RestoreControlsAfterDisconnect()
@@ -750,7 +1709,32 @@ internal sealed class MainForm : Form
         frameFormatCombo.Enabled = true;
         busCombo.Enabled = true;
         statusLabel.Text = "Disconnected";
+        ResetReceiveIndicator();
         UpdateAdapterDescription();
+        UpdateBusHint();
+        UpdateTransmitHint();
+        UpdateTransmitButtonState();
+        UpdateLogButtonState();
+    }
+
+    private static string BuildConnectionErrorMessage(Exception exception, BusProfileOption? busProfile)
+    {
+        if (busProfile is null)
+        {
+            return exception.Message;
+        }
+
+        if (exception is PassThruException passThruException &&
+            busProfile.RequiresPinSelection &&
+            passThruException.Status is PassThruStatus.ErrNotSupported or
+                PassThruStatus.ErrInvalidProtocolId or
+                PassThruStatus.ErrPinInvalid or
+                PassThruStatus.ErrInvalidIoctlValue)
+        {
+            return $"{exception.Message}{Environment.NewLine}{Environment.NewLine}Selected bus: {FormatBusProfileLabel(busProfile)}.{Environment.NewLine}This route uses J2534-2 CAN_PS + J1962_PINS. The current Scanmatik hardware or driver rejected that bus/pin pair.";
+        }
+
+        return exception.Message;
     }
 
     private void UpdateVisibleGridRows(string busName, IEnumerable<string> changedKeys)
@@ -883,7 +1867,7 @@ internal sealed class MainForm : Form
         }
     }
 
-    private void AppendFrameLog(string busName, CanFrame frame)
+    private void AppendFrameLog(StringBuilder builder, string busName, CanFrame frame)
     {
         string dataText = string.Join(' ', frame.Data.Select(static value => value.ToString("X2", CultureInfo.InvariantCulture)));
         if (string.IsNullOrWhiteSpace(dataText))
@@ -891,12 +1875,30 @@ internal sealed class MainForm : Form
             dataText = "-";
         }
 
-        AppendLog($"{frame.ReceivedAtUtc.ToLocalTime():HH:mm:ss.fff}  {busName,-4}  {FormatId(frame.Id, frame.IsExtended),-8}  [{frame.Dlc}]  {dataText}");
+        builder.Append(frame.ReceivedAtUtc.ToLocalTime().ToString("HH:mm:ss.fff", CultureInfo.InvariantCulture))
+            .Append("  ")
+            .Append(busName.PadRight(4))
+            .Append("  ")
+            .Append(FormatId(frame.Id, frame.IsExtended).PadRight(8))
+            .Append("  [")
+            .Append(frame.Dlc.ToString(CultureInfo.InvariantCulture))
+            .Append("]  ")
+            .Append(dataText)
+            .Append(Environment.NewLine);
     }
 
     private void AppendLog(string line)
     {
-        string text = $"{line}{Environment.NewLine}";
+        AppendLogText($"{line}{Environment.NewLine}");
+    }
+
+    private void AppendSessionLogText(string text)
+    {
+        sessionLogWriter?.Write(text);
+    }
+
+    private void AppendLogText(string text)
+    {
         logBox.AppendText(text);
         sessionLogWriter?.Write(text);
 
@@ -972,10 +1974,83 @@ internal sealed class MainForm : Form
         return data[index].ToString("X2", CultureInfo.InvariantCulture);
     }
 
+    private static string FormatTransmitData(TransmitPlan plan)
+    {
+        return plan.Dlc == 0
+            ? "-"
+            : string.Join(' ', plan.Data.Take(plan.Dlc).Select(static value => value.ToString("X2", CultureInfo.InvariantCulture)));
+    }
+
+    private static string BuildTransmitModeSummary(TransmitPlan plan)
+    {
+        return plan.SweepEnabled
+            ? $"Sweep D{plan.SweepByteIndex} {plan.SweepFrom.ToString("X2", CultureInfo.InvariantCulture)}-{plan.SweepTo.ToString("X2", CultureInfo.InvariantCulture)} step {plan.SweepStep.ToString("X2", CultureInfo.InvariantCulture)}"
+            : "Fixed data";
+    }
+
+    private static byte[] BuildCaptureData(byte[] source)
+    {
+        byte[] data = new byte[VisibleByteColumns];
+        Array.Copy(source, data, Math.Min(source.Length, VisibleByteColumns));
+        return data;
+    }
+
     private static string? NormalizeHexFilter(string text)
     {
         string normalized = text.Trim().Replace("0x", string.Empty, StringComparison.OrdinalIgnoreCase);
         return string.IsNullOrWhiteSpace(normalized) ? null : normalized.ToUpperInvariant();
+    }
+
+    private static bool TryParseIdentifier(string text, bool useExtendedIdentifiers, out uint identifier)
+    {
+        string normalized = text.Trim().Replace("0x", string.Empty, StringComparison.OrdinalIgnoreCase);
+        if (!uint.TryParse(normalized, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out identifier))
+        {
+            return false;
+        }
+
+        return useExtendedIdentifiers ? identifier <= 0x1FFFFFFF : identifier <= 0x7FF;
+    }
+
+    private static bool TryParseHexByte(string text, out byte value)
+    {
+        string normalized = text.Trim();
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            value = 0;
+            return true;
+        }
+
+        normalized = normalized.Replace("0x", string.Empty, StringComparison.OrdinalIgnoreCase);
+        return byte.TryParse(normalized, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out value);
+    }
+
+    private static void NormalizeHexByteTextBox(TextBox textBox, string fallbackValue = "00")
+    {
+        if (TryParseHexByte(textBox.Text, out byte value))
+        {
+            textBox.Text = value.ToString("X2", CultureInfo.InvariantCulture);
+        }
+        else
+        {
+            textBox.Text = fallbackValue;
+        }
+    }
+
+    private static TextBox[] CreateTransmitByteTextBoxes()
+    {
+        TextBox[] boxes = new TextBox[VisibleByteColumns];
+        for (int index = 0; index < boxes.Length; index++)
+        {
+            boxes[index] = new TextBox
+            {
+                Width = 38,
+                MaxLength = 2,
+                Text = "00"
+            };
+        }
+
+        return boxes;
     }
 
     private static Label CreateLabel(string text)
@@ -1060,26 +2135,47 @@ internal sealed class MainForm : Form
 
     private sealed class BusProfileOption
     {
-        public BusProfileOption(string name)
+        public BusProfileOption(string name, string displayName, int primaryPin, int secondaryPin, bool usesDefaultCanChannel = false)
         {
             Name = name;
+            DisplayName = displayName;
+            PrimaryPin = primaryPin;
+            SecondaryPin = secondaryPin;
+            UsesDefaultCanChannel = usesDefaultCanChannel;
         }
 
         public string Name { get; }
+        public string DisplayName { get; }
+        public int PrimaryPin { get; }
+        public int SecondaryPin { get; }
+        public bool UsesDefaultCanChannel { get; }
+        public bool RequiresPinSelection => !UsesDefaultCanChannel;
+        public string PinDisplay => $"{PrimaryPin}-{SecondaryPin}";
 
         public override string ToString()
         {
-            return Name;
+            return DisplayName;
+        }
+
+        public uint? GetConnectPins()
+        {
+            if (UsesDefaultCanChannel)
+            {
+                return null;
+            }
+
+            return ((uint)PrimaryPin << 8) | (uint)SecondaryPin;
         }
 
         public static List<BusProfileOption> CreateDefaults()
         {
             return
             [
-                new BusProfileOption("CAN1"),
-                new BusProfileOption("CAN2"),
-                new BusProfileOption("CAN3"),
-                new BusProfileOption("CAN4")
+                new BusProfileOption("CAN1", "CAN1 6-14", 6, 14, usesDefaultCanChannel: true),
+                new BusProfileOption("CAN2", "CAN2 3-11", 3, 11),
+                new BusProfileOption("CAN3", "CAN3 12-13", 12, 13),
+                new BusProfileOption("CAN4", "CAN4 1-9", 1, 9),
+                new BusProfileOption("CAN5", "CAN5 2-10", 2, 10)
             ];
         }
     }
@@ -1113,6 +2209,126 @@ internal sealed class MainForm : Form
                 new SortModeOption("ID", SortMode.ById),
                 new SortModeOption("Activity", SortMode.ByActivity)
             ];
+        }
+    }
+
+    private sealed class TransmitPlan
+    {
+        public TransmitPlan(uint id, bool useExtendedIdentifiers, int dlc, byte[] data, int intervalMs, bool sweepEnabled, int sweepByteIndex, byte sweepFrom, byte sweepTo, byte sweepStep)
+        {
+            Id = id;
+            UseExtendedIdentifiers = useExtendedIdentifiers;
+            Dlc = dlc;
+            Data = data;
+            IntervalMs = intervalMs;
+            SweepEnabled = sweepEnabled;
+            SweepByteIndex = sweepByteIndex;
+            SweepFrom = sweepFrom;
+            SweepTo = sweepTo;
+            SweepStep = sweepStep;
+            CurrentSweepValue = sweepFrom;
+        }
+
+        public uint Id { get; }
+        public bool UseExtendedIdentifiers { get; }
+        public int Dlc { get; }
+        public byte[] Data { get; }
+        public int IntervalMs { get; }
+        public bool SweepEnabled { get; }
+        public int SweepByteIndex { get; }
+        public byte SweepFrom { get; }
+        public byte SweepTo { get; }
+        public byte SweepStep { get; }
+        public int CurrentSweepValue { get; set; }
+
+        public void ResetRuntimeState()
+        {
+            CurrentSweepValue = SweepFrom;
+        }
+
+        public TransmitPlan Clone()
+        {
+            return new TransmitPlan(Id, UseExtendedIdentifiers, Dlc, Data.ToArray(), IntervalMs, SweepEnabled, SweepByteIndex, SweepFrom, SweepTo, SweepStep);
+        }
+    }
+
+    private sealed class TransmitPlanFileModel
+    {
+        public string Id { get; set; } = string.Empty;
+        public bool UseExtendedIdentifiers { get; set; }
+        public int Dlc { get; set; }
+        public string[] Data { get; set; } = [];
+        public int IntervalMs { get; set; }
+        public bool SweepEnabled { get; set; }
+        public int SweepByteIndex { get; set; }
+        public string SweepFrom { get; set; } = "00";
+        public string SweepTo { get; set; } = "FF";
+        public string SweepStep { get; set; } = "01";
+
+        public static TransmitPlanFileModel FromPlan(TransmitPlan plan)
+        {
+            return new TransmitPlanFileModel
+            {
+                Id = FormatId(plan.Id, plan.UseExtendedIdentifiers),
+                UseExtendedIdentifiers = plan.UseExtendedIdentifiers,
+                Dlc = plan.Dlc,
+                Data = plan.Data.Select(static value => value.ToString("X2", CultureInfo.InvariantCulture)).ToArray(),
+                IntervalMs = plan.IntervalMs,
+                SweepEnabled = plan.SweepEnabled,
+                SweepByteIndex = plan.SweepByteIndex,
+                SweepFrom = plan.SweepFrom.ToString("X2", CultureInfo.InvariantCulture),
+                SweepTo = plan.SweepTo.ToString("X2", CultureInfo.InvariantCulture),
+                SweepStep = plan.SweepStep.ToString("X2", CultureInfo.InvariantCulture)
+            };
+        }
+
+        public TransmitPlan ToPlan()
+        {
+            if (!TryParseIdentifier(Id, UseExtendedIdentifiers, out uint identifier))
+            {
+                throw new InvalidDataException($"Invalid TX ID in file: {Id}");
+            }
+
+            int normalizedDlc = Math.Clamp(Dlc, 0, VisibleByteColumns);
+            byte[] data = new byte[VisibleByteColumns];
+            for (int index = 0; index < Math.Min(Data.Length, VisibleByteColumns); index++)
+            {
+                if (!TryParseHexByte(Data[index], out data[index]))
+                {
+                    throw new InvalidDataException($"Invalid TX data byte in file at D{index}: {Data[index]}");
+                }
+            }
+
+            if (!TryParseHexByte(SweepFrom, out byte sweepFrom))
+            {
+                throw new InvalidDataException($"Invalid SweepFrom value in file: {SweepFrom}");
+            }
+
+            if (!TryParseHexByte(SweepTo, out byte sweepTo))
+            {
+                throw new InvalidDataException($"Invalid SweepTo value in file: {SweepTo}");
+            }
+
+            if (!TryParseHexByte(SweepStep, out byte sweepStep) || sweepStep == 0)
+            {
+                throw new InvalidDataException($"Invalid SweepStep value in file: {SweepStep}");
+            }
+
+            int normalizedInterval = Math.Clamp(IntervalMs, 5, 5000);
+            int normalizedSweepIndex = Math.Clamp(SweepByteIndex, 0, VisibleByteColumns - 1);
+            TransmitPlan plan = new(identifier, UseExtendedIdentifiers, normalizedDlc, data, normalizedInterval, SweepEnabled, normalizedSweepIndex, sweepFrom, sweepTo, sweepStep);
+            plan.ResetRuntimeState();
+            return plan;
+        }
+    }
+
+    private sealed class BufferedDataGridView : DataGridView
+    {
+        public BufferedDataGridView()
+        {
+            DoubleBuffered = true;
+            SetStyle(ControlStyles.OptimizedDoubleBuffer, true);
+            UpdateStyles();
         }
     }
 

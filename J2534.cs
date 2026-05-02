@@ -85,12 +85,23 @@ internal static class PassThruRegistry
 
 internal enum PassThruProtocolId : uint
 {
-    Can = 5
+    Can = 5,
+    CanPs = 0x00008004
 }
 
 internal static class PassThruFlags
 {
     public const uint Can29BitId = 0x00000100;
+}
+
+internal enum PassThruIoctlId : uint
+{
+    SetConfig = 0x02
+}
+
+internal enum PassThruConfigId : uint
+{
+    J1962Pins = 0x8001
 }
 
 internal enum PassThruFilterType : uint
@@ -178,6 +189,20 @@ internal struct PassThruMsg
     }
 }
 
+[StructLayout(LayoutKind.Sequential)]
+internal struct PassThruSConfig
+{
+    public uint Parameter;
+    public uint Value;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct PassThruSConfigList
+{
+    public uint NumOfParams;
+    public IntPtr ConfigPtr;
+}
+
 internal sealed class PassThruApi : IDisposable
 {
     private const int ReadVersionBufferLength = 80;
@@ -199,7 +224,13 @@ internal sealed class PassThruApi : IDisposable
     private delegate PassThruStatus PassThruReadMsgsDelegate(uint channelId, [In, Out] PassThruMsg[] messages, ref uint numMsgs, uint timeout);
 
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate PassThruStatus PassThruWriteMsgsDelegate(uint channelId, [In, Out] PassThruMsg[] messages, ref uint numMsgs, uint timeout);
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     private delegate PassThruStatus PassThruStartMsgFilterDelegate(uint channelId, uint filterType, ref PassThruMsg maskMessage, ref PassThruMsg patternMessage, IntPtr flowControlMessage, ref uint filterId);
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate PassThruStatus PassThruIoctlDelegate(uint handleId, uint ioctlId, IntPtr inputPtr, IntPtr outputPtr);
 
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     private delegate PassThruStatus PassThruReadVersionDelegate(uint deviceId, StringBuilder firmwareVersion, StringBuilder dllVersion, StringBuilder apiVersion);
@@ -213,12 +244,16 @@ internal sealed class PassThruApi : IDisposable
     private readonly PassThruConnectDelegate passThruConnect;
     private readonly PassThruDisconnectDelegate passThruDisconnect;
     private readonly PassThruReadMsgsDelegate passThruReadMsgs;
+    private readonly PassThruWriteMsgsDelegate passThruWriteMsgs;
     private readonly PassThruStartMsgFilterDelegate passThruStartMsgFilter;
+    private readonly PassThruIoctlDelegate passThruIoctl;
     private readonly PassThruReadVersionDelegate passThruReadVersion;
     private readonly PassThruGetLastErrorDelegate passThruGetLastError;
+    private readonly object syncRoot = new();
 
     private uint deviceId;
     private uint channelId;
+    private PassThruProtocolId currentCanProtocolId = PassThruProtocolId.Can;
     private bool isDisposed;
 
     public PassThruApi(PassThruDriverInfo driver)
@@ -236,7 +271,9 @@ internal sealed class PassThruApi : IDisposable
         passThruConnect = GetDelegate<PassThruConnectDelegate>("PassThruConnect");
         passThruDisconnect = GetDelegate<PassThruDisconnectDelegate>("PassThruDisconnect");
         passThruReadMsgs = GetDelegate<PassThruReadMsgsDelegate>("PassThruReadMsgs");
+        passThruWriteMsgs = GetDelegate<PassThruWriteMsgsDelegate>("PassThruWriteMsgs");
         passThruStartMsgFilter = GetDelegate<PassThruStartMsgFilterDelegate>("PassThruStartMsgFilter");
+        passThruIoctl = GetDelegate<PassThruIoctlDelegate>("PassThruIoctl");
         passThruReadVersion = GetDelegate<PassThruReadVersionDelegate>("PassThruReadVersion");
         passThruGetLastError = GetDelegate<PassThruGetLastErrorDelegate>("PassThruGetLastError");
     }
@@ -246,58 +283,102 @@ internal sealed class PassThruApi : IDisposable
     public (string FirmwareVersion, string DllVersion, string ApiVersion) OpenAndReadVersion()
     {
         EnsureNotDisposed();
-        EnsureSuccess(passThruOpen(IntPtr.Zero, out deviceId), "PassThruOpen");
+        lock (syncRoot)
+        {
+            EnsureSuccess(passThruOpen(IntPtr.Zero, out deviceId), "PassThruOpen");
 
-        StringBuilder firmwareVersion = new(ReadVersionBufferLength);
-        StringBuilder dllVersion = new(ReadVersionBufferLength);
-        StringBuilder apiVersion = new(ReadVersionBufferLength);
+            StringBuilder firmwareVersion = new(ReadVersionBufferLength);
+            StringBuilder dllVersion = new(ReadVersionBufferLength);
+            StringBuilder apiVersion = new(ReadVersionBufferLength);
 
-        EnsureSuccess(passThruReadVersion(deviceId, firmwareVersion, dllVersion, apiVersion), "PassThruReadVersion");
-        return (firmwareVersion.ToString(), dllVersion.ToString(), apiVersion.ToString());
+            EnsureSuccess(passThruReadVersion(deviceId, firmwareVersion, dllVersion, apiVersion), "PassThruReadVersion");
+            return (firmwareVersion.ToString(), dllVersion.ToString(), apiVersion.ToString());
+        }
     }
 
-    public void ConnectCan(int baudRate, bool useExtendedIdentifiers)
+    public void ConnectCan(int baudRate, bool useExtendedIdentifiers, uint? j1962Pins = null)
     {
         EnsureNotDisposed();
-        if (deviceId == 0)
+        lock (syncRoot)
         {
-            throw new InvalidOperationException("PassThru device is not open.");
-        }
+            if (deviceId == 0)
+            {
+                throw new InvalidOperationException("PassThru device is not open.");
+            }
 
-        uint flags = useExtendedIdentifiers ? PassThruFlags.Can29BitId : 0u;
-        EnsureSuccess(passThruConnect(deviceId, (uint)PassThruProtocolId.Can, flags, (uint)baudRate, out channelId), "PassThruConnect");
-        TryStartCatchAllFilter();
+            PassThruProtocolId protocolId = j1962Pins.HasValue ? PassThruProtocolId.CanPs : PassThruProtocolId.Can;
+            uint flags = useExtendedIdentifiers ? PassThruFlags.Can29BitId : 0u;
+            EnsureSuccess(passThruConnect(deviceId, (uint)protocolId, flags, (uint)baudRate, out channelId), "PassThruConnect");
+            if (j1962Pins.HasValue)
+            {
+                SetJ1962Pins(j1962Pins.Value);
+            }
+
+            currentCanProtocolId = protocolId;
+            TryStartCatchAllFilter();
+        }
     }
 
     public IReadOnlyList<CanFrame> ReadCanFrames(int timeoutMs, int batchSize)
     {
         EnsureNotDisposed();
-        if (channelId == 0)
+        lock (syncRoot)
         {
-            return Array.Empty<CanFrame>();
-        }
-
-        PassThruMsg[] messages = CreateMessageBuffer(batchSize);
-        uint numberOfMessages = (uint)messages.Length;
-        PassThruStatus status = passThruReadMsgs(channelId, messages, ref numberOfMessages, (uint)Math.Max(timeoutMs, 0));
-        if (status is PassThruStatus.ErrTimeout or PassThruStatus.ErrBufferEmpty)
-        {
-            return Array.Empty<CanFrame>();
-        }
-
-        EnsureSuccess(status, "PassThruReadMsgs");
-
-        List<CanFrame> frames = new((int)numberOfMessages);
-        for (int index = 0; index < numberOfMessages; index++)
-        {
-            CanFrame? frame = TryParse(messages[index]);
-            if (frame.HasValue)
+            if (channelId == 0)
             {
-                frames.Add(frame.Value);
+                return Array.Empty<CanFrame>();
             }
+
+            PassThruMsg[] messages = CreateMessageBuffer(batchSize);
+            uint numberOfMessages = (uint)messages.Length;
+            PassThruStatus status = passThruReadMsgs(channelId, messages, ref numberOfMessages, (uint)Math.Max(timeoutMs, 0));
+            if (status is PassThruStatus.ErrTimeout or PassThruStatus.ErrBufferEmpty)
+            {
+                return Array.Empty<CanFrame>();
+            }
+
+            EnsureSuccess(status, "PassThruReadMsgs");
+
+            List<CanFrame> frames = new((int)numberOfMessages);
+            for (int index = 0; index < numberOfMessages; index++)
+            {
+                CanFrame? frame = TryParse(messages[index]);
+                if (frame.HasValue)
+                {
+                    frames.Add(frame.Value);
+                }
+            }
+
+            return frames;
+        }
+    }
+
+    public void WriteCanFrame(uint identifier, bool useExtendedIdentifiers, byte[] data, int dlc, int timeoutMs)
+    {
+        EnsureNotDisposed();
+        ArgumentNullException.ThrowIfNull(data);
+
+        if (dlc < 0 || dlc > 8)
+        {
+            throw new ArgumentOutOfRangeException(nameof(dlc), "DLC must be between 0 and 8 for classic CAN.");
         }
 
-        return frames;
+        if (data.Length < dlc)
+        {
+            throw new ArgumentException("The payload buffer is shorter than the selected DLC.", nameof(data));
+        }
+
+        lock (syncRoot)
+        {
+            if (channelId == 0)
+            {
+                throw new InvalidOperationException("CAN channel is not connected.");
+            }
+
+            PassThruMsg[] messages = [CreateTransmitMessage(currentCanProtocolId, identifier, useExtendedIdentifiers, data, dlc)];
+            uint numberOfMessages = 1;
+            EnsureSuccess(passThruWriteMsgs(channelId, messages, ref numberOfMessages, (uint)Math.Max(timeoutMs, 0)), "PassThruWriteMsgs");
+        }
     }
 
     public void Dispose()
@@ -309,28 +390,31 @@ internal sealed class PassThruApi : IDisposable
 
         isDisposed = true;
 
-        try
+        lock (syncRoot)
         {
-            if (channelId != 0)
+            try
             {
-                passThruDisconnect(channelId);
-                channelId = 0;
+                if (channelId != 0)
+                {
+                    passThruDisconnect(channelId);
+                    channelId = 0;
+                }
             }
-        }
-        catch
-        {
-        }
+            catch
+            {
+            }
 
-        try
-        {
-            if (deviceId != 0)
+            try
             {
-                passThruClose(deviceId);
-                deviceId = 0;
+                if (deviceId != 0)
+                {
+                    passThruClose(deviceId);
+                    deviceId = 0;
+                }
             }
-        }
-        catch
-        {
+            catch
+            {
+            }
         }
 
         NativeLibrary.Free(nativeLibraryHandle);
@@ -381,12 +465,70 @@ internal sealed class PassThruApi : IDisposable
         return buffer;
     }
 
-    private static PassThruMsg CreateFilterMessage(uint identifier)
+    private void SetJ1962Pins(uint j1962Pins)
+    {
+        PassThruSConfig config = new()
+        {
+            Parameter = (uint)PassThruConfigId.J1962Pins,
+            Value = j1962Pins
+        };
+
+        IntPtr configPtr = IntPtr.Zero;
+        IntPtr configListPtr = IntPtr.Zero;
+
+        try
+        {
+            configPtr = Marshal.AllocHGlobal(Marshal.SizeOf<PassThruSConfig>());
+            Marshal.StructureToPtr(config, configPtr, fDeleteOld: false);
+
+            PassThruSConfigList configList = new()
+            {
+                NumOfParams = 1,
+                ConfigPtr = configPtr
+            };
+
+            configListPtr = Marshal.AllocHGlobal(Marshal.SizeOf<PassThruSConfigList>());
+            Marshal.StructureToPtr(configList, configListPtr, fDeleteOld: false);
+
+            EnsureSuccess(
+                passThruIoctl(channelId, (uint)PassThruIoctlId.SetConfig, configListPtr, IntPtr.Zero),
+                "PassThruIoctl(SET_CONFIG/J1962_PINS)");
+        }
+        finally
+        {
+            if (configListPtr != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(configListPtr);
+            }
+
+            if (configPtr != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(configPtr);
+            }
+        }
+    }
+
+    private PassThruMsg CreateFilterMessage(uint identifier)
     {
         PassThruMsg message = PassThruMsg.Create();
-        message.ProtocolId = (uint)PassThruProtocolId.Can;
+        message.ProtocolId = (uint)currentCanProtocolId;
         message.DataSize = 4;
         WriteIdentifier(identifier, message.Data);
+        return message;
+    }
+
+    private static PassThruMsg CreateTransmitMessage(PassThruProtocolId protocolId, uint identifier, bool useExtendedIdentifiers, byte[] data, int dlc)
+    {
+        PassThruMsg message = PassThruMsg.Create();
+        message.ProtocolId = (uint)protocolId;
+        message.TxFlags = useExtendedIdentifiers ? PassThruFlags.Can29BitId : 0u;
+        message.DataSize = (uint)(4 + dlc);
+        WriteIdentifier(useExtendedIdentifiers ? (identifier & 0x1FFFFFFFu) : (identifier & 0x7FFu), message.Data);
+        if (dlc > 0)
+        {
+            Array.Copy(data, 0, message.Data, 4, dlc);
+        }
+
         return message;
     }
 
@@ -400,7 +542,8 @@ internal sealed class PassThruApi : IDisposable
 
     private static CanFrame? TryParse(PassThruMsg message)
     {
-        if (message.ProtocolId != (uint)PassThruProtocolId.Can)
+        if (message.ProtocolId != (uint)PassThruProtocolId.Can &&
+            message.ProtocolId != (uint)PassThruProtocolId.CanPs)
         {
             return null;
         }

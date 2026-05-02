@@ -1,0 +1,15 @@
+C:\Users\vano\Desktop\codex\canscanmatik\obj\Release\net8.0-windows\canscanmatik.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\vano\Desktop\codex\canscanmatik\obj\Release\net8.0-windows\canscanmatik.AssemblyInfoInputs.cache
+C:\Users\vano\Desktop\codex\canscanmatik\obj\Release\net8.0-windows\canscanmatik.AssemblyInfo.cs
+C:\Users\vano\Desktop\codex\canscanmatik\obj\Release\net8.0-windows\canscanmatik.csproj.CoreCompileInputs.cache
+C:\Users\vano\Desktop\codex\canscanmatik\bin\Release\net8.0-windows\CanScanmatik.exe
+C:\Users\vano\Desktop\codex\canscanmatik\bin\Release\net8.0-windows\CanScanmatik.deps.json
+C:\Users\vano\Desktop\codex\canscanmatik\bin\Release\net8.0-windows\CanScanmatik.runtimeconfig.json
+C:\Users\vano\Desktop\codex\canscanmatik\bin\Release\net8.0-windows\CanScanmatik.dll
+C:\Users\vano\Desktop\codex\canscanmatik\bin\Release\net8.0-windows\CanScanmatik.pdb
+C:\Users\vano\Desktop\codex\canscanmatik\obj\Release\net8.0-windows\CanScanmatik.dll
+C:\Users\vano\Desktop\codex\canscanmatik\obj\Release\net8.0-windows\refint\CanScanmatik.dll
+C:\Users\vano\Desktop\codex\canscanmatik\obj\Release\net8.0-windows\CanScanmatik.pdb
+C:\Users\vano\Desktop\codex\canscanmatik\obj\Release\net8.0-windows\canscanmatik.genruntimeconfig.cache
+C:\Users\vano\Desktop\codex\canscanmatik\obj\Release\net8.0-windows\ref\CanScanmatik.dll
+C:\Users\vano\Desktop\codex\canscanmatik\obj\Release\net8.0-windows\canscanmatik.sourcelink.json
