@@ -1,0 +1,11 @@
+C:\Users\vano\Documents\GitHub\canscanmatik\obj\Debug\net48\canscanmatik.csproj.AssemblyReference.cache
+C:\Users\vano\Documents\GitHub\canscanmatik\obj\Debug\net48\canscanmatik.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\vano\Documents\GitHub\canscanmatik\obj\Debug\net48\canscanmatik.AssemblyInfoInputs.cache
+C:\Users\vano\Documents\GitHub\canscanmatik\obj\Debug\net48\canscanmatik.AssemblyInfo.cs
+C:\Users\vano\Documents\GitHub\canscanmatik\obj\Debug\net48\canscanmatik.csproj.CoreCompileInputs.cache
+C:\Users\vano\Documents\GitHub\canscanmatik\obj\Debug\net48\canscanmatik.sourcelink.json
+C:\Users\vano\Documents\GitHub\canscanmatik\bin\Debug\net48\CanScanmatik.exe.config
+C:\Users\vano\Documents\GitHub\canscanmatik\bin\Debug\net48\CanScanmatik.exe
+C:\Users\vano\Documents\GitHub\canscanmatik\bin\Debug\net48\CanScanmatik.pdb
+C:\Users\vano\Documents\GitHub\canscanmatik\obj\Debug\net48\CanScanmatik.exe
+C:\Users\vano\Documents\GitHub\canscanmatik\obj\Debug\net48\CanScanmatik.pdb

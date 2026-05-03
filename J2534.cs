@@ -238,7 +238,7 @@ internal sealed class PassThruApi : IDisposable
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     private delegate PassThruStatus PassThruGetLastErrorDelegate(StringBuilder errorDescription);
 
-    private readonly nint nativeLibraryHandle;
+    private readonly IntPtr nativeLibraryHandle;
     private readonly PassThruOpenDelegate passThruOpen;
     private readonly PassThruCloseDelegate passThruClose;
     private readonly PassThruConnectDelegate passThruConnect;
@@ -265,7 +265,7 @@ internal sealed class PassThruApi : IDisposable
             throw new FileNotFoundException("J2534 DLL was not found.", driver.FunctionLibrary);
         }
 
-        nativeLibraryHandle = NativeLibrary.Load(driver.FunctionLibrary);
+        nativeLibraryHandle = LoadNativeLibrary(driver.FunctionLibrary);
         passThruOpen = GetDelegate<PassThruOpenDelegate>("PassThruOpen");
         passThruClose = GetDelegate<PassThruCloseDelegate>("PassThruClose");
         passThruConnect = GetDelegate<PassThruConnectDelegate>("PassThruConnect");
@@ -356,7 +356,10 @@ internal sealed class PassThruApi : IDisposable
     public void WriteCanFrame(uint identifier, bool useExtendedIdentifiers, byte[] data, int dlc, int timeoutMs)
     {
         EnsureNotDisposed();
-        ArgumentNullException.ThrowIfNull(data);
+        if (data is null)
+        {
+            throw new ArgumentNullException(nameof(data));
+        }
 
         if (dlc < 0 || dlc > 8)
         {
@@ -417,7 +420,7 @@ internal sealed class PassThruApi : IDisposable
             }
         }
 
-        NativeLibrary.Free(nativeLibraryHandle);
+        FreeNativeLibrary(nativeLibraryHandle);
     }
 
     private void TryStartCatchAllFilter()
@@ -455,7 +458,7 @@ internal sealed class PassThruApi : IDisposable
 
     private static PassThruMsg[] CreateMessageBuffer(int batchSize)
     {
-        int actualSize = Math.Clamp(batchSize, 1, 64);
+        int actualSize = Compat.Clamp(batchSize, 1, 64);
         PassThruMsg[] buffer = new PassThruMsg[actualSize];
         for (int index = 0; index < buffer.Length; index++)
         {
@@ -574,12 +577,70 @@ internal sealed class PassThruApi : IDisposable
 
     private T GetDelegate<T>(string exportName) where T : Delegate
     {
-        nint export = NativeLibrary.GetExport(nativeLibraryHandle, exportName);
+        IntPtr export = GetNativeExport(nativeLibraryHandle, exportName);
         return Marshal.GetDelegateForFunctionPointer<T>(export);
     }
 
     private void EnsureNotDisposed()
     {
-        ObjectDisposedException.ThrowIf(isDisposed, this);
+        if (isDisposed)
+        {
+            throw new ObjectDisposedException(nameof(PassThruApi));
+        }
     }
+
+    private static IntPtr LoadNativeLibrary(string libraryPath)
+    {
+#if NETFRAMEWORK
+        IntPtr handle = LoadLibrary(libraryPath);
+        if (handle == IntPtr.Zero)
+        {
+            throw new InvalidOperationException($"Unable to load native library '{libraryPath}'. Win32 error: {Marshal.GetLastWin32Error()}.");
+        }
+
+        return handle;
+#else
+        return NativeLibrary.Load(libraryPath);
+#endif
+    }
+
+    private static IntPtr GetNativeExport(IntPtr libraryHandle, string exportName)
+    {
+#if NETFRAMEWORK
+        IntPtr export = GetProcAddress(libraryHandle, exportName);
+        if (export == IntPtr.Zero)
+        {
+            throw new EntryPointNotFoundException(exportName);
+        }
+
+        return export;
+#else
+        return NativeLibrary.GetExport(libraryHandle, exportName);
+#endif
+    }
+
+    private static void FreeNativeLibrary(IntPtr libraryHandle)
+    {
+        if (libraryHandle == IntPtr.Zero)
+        {
+            return;
+        }
+
+#if NETFRAMEWORK
+        _ = FreeLibrary(libraryHandle);
+#else
+        NativeLibrary.Free(libraryHandle);
+#endif
+    }
+
+#if NETFRAMEWORK
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr LoadLibrary(string lpFileName);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Ansi, SetLastError = true)]
+    private static extern IntPtr GetProcAddress(IntPtr hModule, string lpProcName);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool FreeLibrary(IntPtr hModule);
+#endif
 }

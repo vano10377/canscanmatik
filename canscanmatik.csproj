@@ -2,14 +2,19 @@
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net8.0-windows</TargetFramework>
+    <TargetFrameworks>net8.0-windows;net48</TargetFrameworks>
     <AssemblyName>CanScanmatik</AssemblyName>
     <RootNamespace>CanScanmatik</RootNamespace>
     <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
     <Platforms>x86</Platforms>
     <PlatformTarget>x86</PlatformTarget>
   </PropertyGroup>
+
+  <ItemGroup Condition="'$(TargetFramework)' == 'net48'">
+    <Reference Include="System.Runtime.Serialization" />
+  </ItemGroup>
 
 </Project>

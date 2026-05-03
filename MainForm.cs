@@ -2,7 +2,6 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
 using System.Text;
-using System.Text.Json;
 
 namespace CanScanmatik;
 
@@ -24,7 +23,7 @@ internal sealed class MainForm : Form
     private readonly ComboBox frameFormatCombo = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 125 };
     private readonly ComboBox busCombo = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 126 };
     private readonly ComboBox sortCombo = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 110 };
-    private readonly TextBox filterTextBox = new() { Width = 100, PlaceholderText = "208" };
+    private readonly TextBox filterTextBox = new() { Width = 100 };
     private readonly Button refreshButton = new() { Text = "Refresh", AutoSize = true };
     private readonly Button configButton = new() { Text = "Config", AutoSize = true };
     private readonly Button connectButton = new() { Text = "Connect", AutoSize = true };
@@ -36,7 +35,7 @@ internal sealed class MainForm : Form
     private readonly Label rxInfoLabel = new() { AutoSize = true, Text = "RX: 0" };
     private readonly Label adapterInfoLabel = new() { AutoSize = true };
     private readonly Label busHintLabel = new() { AutoSize = true };
-    private readonly TextBox txIdTextBox = new() { Width = 110, Text = "208", PlaceholderText = "208" };
+    private readonly TextBox txIdTextBox = new() { Width = 110, Text = "208" };
     private readonly NumericUpDown txDlcUpDown = new() { Minimum = 0, Maximum = VisibleByteColumns, Width = 55, Value = 8 };
     private readonly TextBox[] txByteTextBoxes = CreateTransmitByteTextBoxes();
     private readonly NumericUpDown txIntervalUpDown = new() { Minimum = 5, Maximum = 5000, Width = 75, Value = 100 };
@@ -92,6 +91,9 @@ internal sealed class MainForm : Form
 
     public MainForm()
     {
+        WinFormsCompat.SetPlaceholderText(filterTextBox, "208");
+        WinFormsCompat.SetPlaceholderText(txIdTextBox, "208");
+
         InitializeUi();
         HookEvents();
         EnsureBusWorkspaces();
@@ -487,8 +489,8 @@ internal sealed class MainForm : Form
         }
 
         if (driver is not null &&
-            driver.DisplayName.Contains("SM2", StringComparison.OrdinalIgnoreCase) &&
-            !driver.DisplayName.Contains("SM3", StringComparison.OrdinalIgnoreCase))
+            Compat.ContainsIgnoreCase(driver.DisplayName, "SM2") &&
+            !Compat.ContainsIgnoreCase(driver.DisplayName, "SM3"))
         {
             builder.Append(" The SM2 driver name does not show whether the hardware is SM2 or SM2-PRO.");
             builder.Append(" Officially: plain SM2 supports CAN1 6-14 and CAN2 3-11; CAN3 12-13 needs SM2-PRO/SM3; CAN4 1-9 and CAN5 2-10 are SM3-class routes.");
@@ -1021,7 +1023,7 @@ internal sealed class MainForm : Form
         transmitQueue.Add(plan!);
         RefreshTransmitQueueGrid();
         txQueueGrid.ClearSelection();
-        txQueueGrid.Rows[^1].Selected = true;
+        txQueueGrid.Rows[txQueueGrid.Rows.Count - 1].Selected = true;
         AppendLog($"TXADD {FormatId(plan!.Id, plan.UseExtendedIdentifiers)}");
     }
 
@@ -1097,12 +1099,7 @@ internal sealed class MainForm : Form
             .Select(static item => TransmitPlanFileModel.FromPlan(item))
             .ToList();
 
-        JsonSerializerOptions options = new()
-        {
-            WriteIndented = true
-        };
-
-        string json = JsonSerializer.Serialize(fileModels, options);
+        string json = JsonCompat.Serialize(fileModels);
         File.WriteAllText(dialog.FileName, json, new UTF8Encoding(false));
         AppendLog($"TXSAVE {dialog.FileName}");
     }
@@ -1123,7 +1120,7 @@ internal sealed class MainForm : Form
         try
         {
             string json = File.ReadAllText(dialog.FileName, Encoding.UTF8);
-            List<TransmitPlanFileModel>? fileModels = JsonSerializer.Deserialize<List<TransmitPlanFileModel>>(json);
+            List<TransmitPlanFileModel>? fileModels = JsonCompat.Deserialize<List<TransmitPlanFileModel>>(json);
             if (fileModels is null || fileModels.Count == 0)
             {
                 MessageBox.Show(this, "The selected file does not contain any TX frames.", "CanScanmatik", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -1180,7 +1177,7 @@ internal sealed class MainForm : Form
                 : "00";
         }
 
-        txIntervalUpDown.Value = Math.Clamp(plan.IntervalMs, Decimal.ToInt32(txIntervalUpDown.Minimum), Decimal.ToInt32(txIntervalUpDown.Maximum));
+        txIntervalUpDown.Value = Compat.Clamp(plan.IntervalMs, Decimal.ToInt32(txIntervalUpDown.Minimum), Decimal.ToInt32(txIntervalUpDown.Maximum));
         sweepEnabledCheckBox.Checked = plan.SweepEnabled;
         sweepByteCombo.SelectedIndex = plan.SweepByteIndex;
         sweepFromTextBox.Text = plan.SweepFrom.ToString("X2", CultureInfo.InvariantCulture);
@@ -1423,7 +1420,7 @@ internal sealed class MainForm : Form
     {
         string dataText = plan.Dlc == 0
             ? "-"
-            : string.Join(' ', payload.Take(plan.Dlc).Select(static value => value.ToString("X2", CultureInfo.InvariantCulture)));
+            : string.Join(" ", payload.Take(plan.Dlc).Select(static value => value.ToString("X2", CultureInfo.InvariantCulture)));
 
         AppendLog($"TX    {GetSelectedBusName(),-4}  {FormatId(plan.Id, plan.UseExtendedIdentifiers),-8}  [{plan.Dlc}]  {dataText}{sweepSuffix}");
     }
@@ -1512,7 +1509,7 @@ internal sealed class MainForm : Form
             return;
         }
 
-        TransmitPlan capturedPlan = new(snapshot.Id, snapshot.IsExtended, Math.Clamp(snapshot.Dlc, 0, VisibleByteColumns), BuildCaptureData(snapshot.Data), 100, false, 0, 0x00, 0xFF, 0x01);
+        TransmitPlan capturedPlan = new(snapshot.Id, snapshot.IsExtended, Compat.Clamp(snapshot.Dlc, 0, VisibleByteColumns), BuildCaptureData(snapshot.Data), 100, false, 0, 0x00, 0xFF, 0x01);
         LoadTransmitPlanIntoEditor(capturedPlan);
         AppendLog($"TXCAP {snapshot.BusName,-4}  {FormatId(snapshot.Id, snapshot.IsExtended)}");
     }
@@ -1869,7 +1866,7 @@ internal sealed class MainForm : Form
 
     private void AppendFrameLog(StringBuilder builder, string busName, CanFrame frame)
     {
-        string dataText = string.Join(' ', frame.Data.Select(static value => value.ToString("X2", CultureInfo.InvariantCulture)));
+        string dataText = string.Join(" ", frame.Data.Select(static value => value.ToString("X2", CultureInfo.InvariantCulture)));
         if (string.IsNullOrWhiteSpace(dataText))
         {
             dataText = "-";
@@ -1904,7 +1901,7 @@ internal sealed class MainForm : Form
 
         if (logBox.TextLength > LogTrimThreshold)
         {
-            logBox.Text = logBox.Text[^LogTargetLength..];
+            logBox.Text = logBox.Text.Substring(logBox.TextLength - LogTargetLength);
         }
 
         logBox.SelectionStart = logBox.TextLength;
@@ -1934,7 +1931,7 @@ internal sealed class MainForm : Form
             return true;
         }
 
-        return FormatId(snapshot.Id, snapshot.IsExtended).Contains(filterText, StringComparison.OrdinalIgnoreCase);
+        return Compat.ContainsIgnoreCase(FormatId(snapshot.Id, snapshot.IsExtended), filterText);
     }
 
     private static string GetFrameKey(uint identifier, bool isExtended)
@@ -1978,7 +1975,7 @@ internal sealed class MainForm : Form
     {
         return plan.Dlc == 0
             ? "-"
-            : string.Join(' ', plan.Data.Take(plan.Dlc).Select(static value => value.ToString("X2", CultureInfo.InvariantCulture)));
+            : string.Join(" ", plan.Data.Take(plan.Dlc).Select(static value => value.ToString("X2", CultureInfo.InvariantCulture)));
     }
 
     private static string BuildTransmitModeSummary(TransmitPlan plan)
@@ -1997,13 +1994,13 @@ internal sealed class MainForm : Form
 
     private static string? NormalizeHexFilter(string text)
     {
-        string normalized = text.Trim().Replace("0x", string.Empty, StringComparison.OrdinalIgnoreCase);
+        string normalized = Compat.RemoveHexPrefix(text.Trim());
         return string.IsNullOrWhiteSpace(normalized) ? null : normalized.ToUpperInvariant();
     }
 
     private static bool TryParseIdentifier(string text, bool useExtendedIdentifiers, out uint identifier)
     {
-        string normalized = text.Trim().Replace("0x", string.Empty, StringComparison.OrdinalIgnoreCase);
+        string normalized = Compat.RemoveHexPrefix(text.Trim());
         if (!uint.TryParse(normalized, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out identifier))
         {
             return false;
@@ -2021,7 +2018,7 @@ internal sealed class MainForm : Form
             return true;
         }
 
-        normalized = normalized.Replace("0x", string.Empty, StringComparison.OrdinalIgnoreCase);
+        normalized = Compat.RemoveHexPrefix(normalized);
         return byte.TryParse(normalized, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out value);
     }
 
@@ -2289,7 +2286,7 @@ internal sealed class MainForm : Form
                 throw new InvalidDataException($"Invalid TX ID in file: {Id}");
             }
 
-            int normalizedDlc = Math.Clamp(Dlc, 0, VisibleByteColumns);
+            int normalizedDlc = Compat.Clamp(Dlc, 0, VisibleByteColumns);
             byte[] data = new byte[VisibleByteColumns];
             for (int index = 0; index < Math.Min(Data.Length, VisibleByteColumns); index++)
             {
@@ -2314,8 +2311,8 @@ internal sealed class MainForm : Form
                 throw new InvalidDataException($"Invalid SweepStep value in file: {SweepStep}");
             }
 
-            int normalizedInterval = Math.Clamp(IntervalMs, 5, 5000);
-            int normalizedSweepIndex = Math.Clamp(SweepByteIndex, 0, VisibleByteColumns - 1);
+            int normalizedInterval = Compat.Clamp(IntervalMs, 5, 5000);
+            int normalizedSweepIndex = Compat.Clamp(SweepByteIndex, 0, VisibleByteColumns - 1);
             TransmitPlan plan = new(identifier, UseExtendedIdentifiers, normalizedDlc, data, normalizedInterval, SweepEnabled, normalizedSweepIndex, sweepFrom, sweepTo, sweepStep);
             plan.ResetRuntimeState();
             return plan;
